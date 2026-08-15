@@ -108,8 +108,8 @@ func (a *App) evaluateWatchdogs(username string, offline bool) {
 	for _, alert := range pending {
 		alert := alert
 		go func() {
-			message := fmt.Sprintf("【告警名称】 %s \n\n【告警时间】 %s  \n\n【用户名】 %s \n\n【节点名】 %s \n\n【虚拟化】 %s \n\n【主机名】 %s \n\n【位  置】 %s",
-				alert.rule.Name, now.Format("2006-01-02 15:04:05"), alert.node.Username, alert.node.Name, alert.node.Type, alert.node.Host, alert.node.Location)
+			message := fmt.Sprintf("【事件】 %s \n【节点名】 %s【主机名】 %s \n【用户名】 %s【位置】 %s \n【时间】 %s",
+				alert.rule.Name, alert.node.Name, alert.node.Host, alert.node.Username, alert.node.Location, now.Format("2006-01-02 15:04:05"))
 			if err := a.sendCallback(alert.rule.Callback, message, "ServerStatus"); err != nil {
 				a.logger.Printf("watchdog %q callback: %v", alert.rule.Name, err)
 			}

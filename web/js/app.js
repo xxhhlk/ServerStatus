@@ -736,7 +736,12 @@ function bindTheme(){
   const apply = (light) => { document.body.classList.toggle('light', light); document.documentElement.classList.toggle('light', light); };
   const saved = localStorage.getItem('theme');
   apply(saved ? saved === 'light' : mql.matches);
-  mql.addEventListener('change', e => { if(!localStorage.getItem('theme')) apply(e.matches); });
+  // iOS 13 Safari 不支持 addEventListener，回退 addListener
+  if (mql.addEventListener) {
+    mql.addEventListener('change', e => { if(!localStorage.getItem('theme')) apply(e.matches); });
+  } else if (mql.addListener) {
+    mql.addListener(e => { if(!localStorage.getItem('theme')) apply(e.matches); });
+  }
   btn.addEventListener('click', () => {
     const toLight = !document.body.classList.contains('light');
     apply(toLight);
