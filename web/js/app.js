@@ -362,8 +362,10 @@ function alertStats(){
 }
 
 function normalizeServersToolbarState(){
-  // custom: 有节点即显示工具栏（上游 >10 才显示，节点少时看不到搜索/排序）
-  const show = S.activeTab === 'servers' && S.servers.length > 0;
+  // custom: 修复死胡同——≤10 节点时工具栏隐藏，但表头排序仍可用；
+  // 排序一旦偏离"配置顺序"，必须显示工具栏才能切回
+  const show = S.activeTab === 'servers' &&
+               (S.servers.length > 10 || S.filters.sort !== 'config');
   $('serversToolbar').style.display = show ? 'flex' : 'none';
 }
 
