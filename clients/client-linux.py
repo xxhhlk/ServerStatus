@@ -243,9 +243,9 @@ def tupd():
 
 def get_network(ip_version):
     if(ip_version == 4):
-        HOST = "ipv4.google.com"
+        HOST = "ipv4.ip.sb"
     elif(ip_version == 6):
-        HOST = "ipv6.google.com"
+        HOST = "ipv6.ip.sb"
     try:
         socket.create_connection((HOST, 80), 2).close()
         return True
