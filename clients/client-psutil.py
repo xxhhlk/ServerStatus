@@ -25,14 +25,13 @@ import time
 import timeit
 import os
 import sys
+import subprocess
 import json
 import errno
 import psutil
 import threading
 import platform
 from queue import Queue
-
-_net_io_counters_lock = threading.Lock()
 
 def _env_str(name, default):
     value = os.getenv(name)
@@ -148,24 +147,101 @@ def get_cpu_model():
         return vendor
     return get_platform_cpu_arch()
 
-def _get_net_io_counters():
-    with _net_io_counters_lock:
-        return psutil.net_io_counters(pernic=True)
+# --- 虚拟网卡识别（非 MAC 方案） ---
+# Windows: WMI PNPDeviceID 前缀 PCI\ / USB\ = 物理；其余（ROOT\ / SWD\ / BTH\ / {GUID}）= 虚拟。
+#          VM 内主网卡（VEN_80EE / 1AF4 / 15AD）也是 PCI\，不会被误伤。
+# Linux:   /sys/class/net/<if>/device 软链接不存在 → 非物理（lo/docker0/veth/tun/br-）。
+_win_physical = None
+_win_cache_clock = 0.0
+_WIN_NAME_HINTS = ('Loopback', 'Wi-Fi Direct', 'WAN Miniport', 'Bluetooth',
+                   'Apple Mobile', 'Kernel Debug', 'TAP-', 'OpenVPN',
+                   'Tailscale', 'WireGuard', 'VMware', 'VirtualBox',
+                   'Host-Only', 'vEthernet', 'Default Switch')
+
+def _win_is_physical(pnp_id):
+    """PCI 或 USB 开头 → 物理网卡"""
+    return bool(pnp_id) and pnp_id.startswith(('PCI\\', 'USB\\'))
+
+def _win_build_map():
+    """NetConnectionID → 是否物理。10 分钟缓存一次，避免每轮调 PowerShell"""
+    ps = ("[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+          "Get-CimInstance Win32_NetworkAdapter | "
+          "Where-Object { $_.NetConnectionID } | "
+          "Select-Object NetConnectionID, PNPDeviceID | ConvertTo-Json -Compress")
+    out = subprocess.run(['powershell', '-NoProfile', '-Command', ps],
+                         capture_output=True, text=True, encoding='utf-8',
+                         errors='replace', timeout=10).stdout
+    items = json.loads(out)
+    if isinstance(items, dict):
+        items = [items]
+    return {it['NetConnectionID']: _win_is_physical(it['PNPDeviceID']) for it in items}
+
+def is_virtual_nic(name):
+    """排除虚拟网卡和回环接口"""
+    if sys.platform.startswith('win'):
+        global _win_physical, _win_cache_clock
+        now = time.time()
+        if _win_physical is None or now - _win_cache_clock > 600:
+            try:
+                _win_physical = _win_build_map()
+                _win_cache_clock = now
+            except Exception:
+                _win_physical = _win_physical or {}   # 失败保留旧值，宁可多统计不崩
+        if name in _win_physical:
+            return not _win_physical[name]
+        if any(h in name for h in _WIN_NAME_HINTS):
+            return True
+        try:
+            return psutil.net_if_stats()[name].speed == 0
+        except Exception:
+            return False
+    if name == 'lo':
+        return True
+    if not os.access('/sys/class/net', os.R_OK):
+        return False   # /sys 不可读（Android 非 root）→ 无法判断，宁可计入
+    return not os.path.exists('/sys/class/net/%s/device' % name)
+
+_net_in = 0
+_net_out = 0
+_net_lock = threading.Lock()
+
+def _net_monitor():
+    """独立线程：唯一调用 psutil.net_io_counters 的地方，读累计值存全局并算网速"""
+    global _net_in, _net_out
+    prev_in = 0
+    prev_out = 0
+    prev_clock = 0
+    while True:
+        try:
+            total_in = 0
+            total_out = 0
+            net = psutil.net_io_counters(pernic=True)
+            for k, v in net.items():
+                if is_virtual_nic(k):
+                    continue
+                total_in += v[1]
+                total_out += v[0]
+            with _net_lock:
+                _net_in = total_in
+                _net_out = total_out
+            now_clock = time.time()
+            if prev_clock > 0:
+                diff = now_clock - prev_clock
+                if diff > 0:
+                    netSpeed["netrx"] = int((total_in - prev_in) / diff)
+                    netSpeed["nettx"] = int((total_out - prev_out) / diff)
+            prev_in = total_in
+            prev_out = total_out
+            prev_clock = now_clock
+        except Exception:
+            # 保留最后有效值，短暂等待后自动重试，避免线程永久退出
+            pass
+        time.sleep(INTERVAL)
 
 def liuliang():
-    NET_IN = 0
-    NET_OUT = 0
-    net = _get_net_io_counters()
-    for k, v in net.items():
-        if 'lo' in k or 'tun' in k \
-                or 'docker' in k or 'veth' in k \
-                or 'br-' in k or 'vmbr' in k \
-                or 'vnet' in k or 'kube' in k:
-            continue
-        else:
-            NET_IN += v[1]
-            NET_OUT += v[0]
-    return NET_IN, NET_OUT
+    """主循环读取：只读独立线程存下的全局值，不调 psutil"""
+    with _net_lock:
+        return _net_in, _net_out
 
 def tupd():
     '''
@@ -274,27 +350,6 @@ def _ping_thread(host, mark, port):
 
         time.sleep(INTERVAL)
 
-def _net_speed():
-    while True:
-        avgrx = 0
-        avgtx = 0
-        for name, stats in _get_net_io_counters().items():
-            if "lo" in name or "tun" in name \
-                    or "docker" in name or "veth" in name \
-                    or "br-" in name or "vmbr" in name \
-                    or "vnet" in name or "kube" in name:
-                continue
-            avgrx += stats.bytes_recv
-            avgtx += stats.bytes_sent
-        now_clock = time.time()
-        netSpeed["diff"] = now_clock - netSpeed["clock"]
-        netSpeed["clock"] = now_clock
-        netSpeed["netrx"] = int((avgrx - netSpeed["avgrx"]) / netSpeed["diff"])
-        netSpeed["nettx"] = int((avgtx - netSpeed["avgtx"]) / netSpeed["diff"])
-        netSpeed["avgrx"] = avgrx
-        netSpeed["avgtx"] = avgtx
-        time.sleep(INTERVAL)
-
 def _disk_io():
     """
     the code is by: https://github.com/giampaolo/psutil/blob/master/scripts/iotop.py
@@ -381,7 +436,7 @@ def get_realtime_data():
         }
     )
     t4 = threading.Thread(
-        target=_net_speed,
+        target=_net_monitor,
     )
     t5 = threading.Thread(
         target=_disk_io,
