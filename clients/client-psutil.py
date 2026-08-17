@@ -172,7 +172,25 @@ def get_platform_cpu_vendor():
 def get_platform_cpu_arch():
     return normalize_cpu_model(platform.machine() or platform.processor() or platform.architecture()[0])
 
+def _win_cpu_model():
+    """Windows: 注册表 ProcessorNameString 为标准品牌名（platform.processor() 只是 Family/Model 编码）"""
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                             r"HARDWARE\DESCRIPTION\System\CentralProcessor\0")
+        try:
+            val, _ = winreg.QueryValueEx(key, "ProcessorNameString")
+            return normalize_cpu_model(val)
+        finally:
+            winreg.CloseKey(key)
+    except Exception:
+        return None
+
 def get_cpu_model():
+    if sys.platform.startswith('win'):
+        m = _win_cpu_model()
+        if m:
+            return m
     for value in (platform.processor(), getattr(platform.uname(), 'processor', '')):
         value = normalize_cpu_model(value)
         if value and not is_generic_cpu_model(value):
