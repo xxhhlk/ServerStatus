@@ -252,6 +252,21 @@ def get_network(ip_version):
     except:
         return False
 
+_online_status = {4: False, 6: False}
+_online_target = 4
+
+def _net_probe_thread():
+    """独立线程：每 10s 探测一次 online4/online6，避免 DNS 卡死阻塞主循环上报。
+    主循环只读 _online_status 快照；_online_target 由主循环在连接后设置。"""
+    global _online_status
+    while True:
+        target = _online_target
+        try:
+            _online_status[target] = get_network(target)
+        except Exception:
+            _online_status[target] = False
+        time.sleep(10)
+
 lostRate = {
     '10010': 0.0,
     '189': 0.0,
@@ -435,7 +450,10 @@ def get_realtime_data():
     t5 = threading.Thread(
         target=_disk_io,
     )
-    for ti in [t1, t2, t3, t4, t5]:
+    t6 = threading.Thread(
+        target=_net_probe_thread,
+    )
+    for ti in [t1, t2, t3, t4, t5, t6]:
         ti.daemon = True
         ti.start()
 
@@ -565,7 +583,6 @@ if __name__ == '__main__':
                         t.daemon = True
                         t.start()
 
-            timer = 0
             check_ip = 0
             if data.find("IPv4") > -1:
                 check_ip = 6
@@ -575,6 +592,7 @@ if __name__ == '__main__':
                 print(data)
                 raise socket.error
 
+            _online_target = check_ip
             CPUCores = get_cpu_cores()
             CPUModel = get_cpu_model()
             while True:
@@ -585,11 +603,8 @@ if __name__ == '__main__':
                 MemoryTotal, MemoryUsed, SwapTotal, SwapFree = get_memory()
                 HDDTotal, HDDUsed = get_hdd()
                 array = {}
-                if not timer:
-                    array['online' + str(check_ip)] = get_network(check_ip)
-                    timer = 10
-                else:
-                    timer -= 1*INTERVAL
+                # 在线探测已由独立线程 _net_probe_thread 负责，主循环只读快照（DNS 卡死不阻塞上报）
+                array['online' + str(check_ip)] = _online_status.get(check_ip, False)
 
                 array['uptime'] = Uptime
                 array['load_1'] = Load_1
