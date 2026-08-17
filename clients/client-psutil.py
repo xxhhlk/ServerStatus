@@ -73,7 +73,36 @@ def parse_cli_args(arguments):
 def get_uptime():
     return int(time.time() - psutil.boot_time())
 
+def _win_mem_no_cache():
+    """GetPerformanceInfo：一次调用拿 total/free/SystemCache，used 排除系统缓存（近似 Linux cached 语义）。
+    返回 (total_kb, used_kb)；失败返回 None。"""
+    import ctypes
+    from ctypes import wintypes
+    class PERF_INFO(ctypes.Structure):
+        _fields_ = [
+            ('cb', wintypes.DWORD), ('CommitTotal', ctypes.c_size_t),
+            ('CommitLimit', ctypes.c_size_t), ('CommitPeak', ctypes.c_size_t),
+            ('PhysicalTotal', ctypes.c_size_t), ('PhysicalAvailable', ctypes.c_size_t),
+            ('SystemCache', ctypes.c_size_t), ('KernelTotal', ctypes.c_size_t),
+            ('KernelPaged', ctypes.c_size_t), ('KernelNonpaged', ctypes.c_size_t),
+            ('PageSize', ctypes.c_size_t), ('HandleCount', wintypes.DWORD),
+            ('ProcessCount', wintypes.DWORD), ('ThreadCount', wintypes.DWORD),
+        ]
+    pi = PERF_INFO()
+    pi.cb = ctypes.sizeof(PERF_INFO)
+    if not ctypes.windll.psapi.GetPerformanceInfo(ctypes.byref(pi), pi.cb):
+        return None
+    page = pi.PageSize
+    total = pi.PhysicalTotal * page
+    free = pi.PhysicalAvailable * page
+    cache = pi.SystemCache * page        # standby + modified + 活动映射
+    return int(total/1024.0), int((total - free - cache)/1024.0)
+
 def get_memory():
+    if sys.platform.startswith("win"):
+        r = _win_mem_no_cache()
+        if r:
+            return r
     Mem = psutil.virtual_memory()
     return int(Mem.total / 1024.0), int(Mem.used / 1024.0)
 
