@@ -49,17 +49,18 @@ def _env_int(name, default):
         return default
 
 # Allow docker env overrides. 优先级：运行程序传递参数 > 用户修改的USER > Docker/系统
-SERVER = _env_str("SERVER", SERVER) if SERVER == "" else SERVER
-USER = _env_str("USER", USER) if USER == "" else USER
-PASSWORD = _env_str("PASSWORD", PASSWORD)
-PORT = _env_int("PORT", PORT)
-INTERVAL = _env_int("INTERVAL", INTERVAL)
-PROBEPORT = _env_int("PROBEPORT", PROBEPORT)
-PROBE_PROTOCOL_PREFER = _env_str("PROBE_PROTOCOL_PREFER", PROBE_PROTOCOL_PREFER)
-PING_PACKET_HISTORY_LEN = _env_int("PING_PACKET_HISTORY_LEN", PING_PACKET_HISTORY_LEN)
-CU = _env_str("CU", CU)
-CT = _env_str("CT", CT)
-CM = _env_str("CM", CM)
+# 环境变量统一加 serverstatus_ 前缀（如 serverstatus_SERVER、serverstatus_PASSWORD）
+SERVER = _env_str("serverstatus_SERVER", SERVER) if SERVER == "" else SERVER
+USER = _env_str("serverstatus_USER", USER) if USER == "" else USER
+PASSWORD = _env_str("serverstatus_PASSWORD", PASSWORD)
+PORT = _env_int("serverstatus_PORT", PORT)
+INTERVAL = _env_int("serverstatus_INTERVAL", INTERVAL)
+PROBEPORT = _env_int("serverstatus_PROBEPORT", PROBEPORT)
+PROBE_PROTOCOL_PREFER = _env_str("serverstatus_PROBE_PROTOCOL_PREFER", PROBE_PROTOCOL_PREFER)
+PING_PACKET_HISTORY_LEN = _env_int("serverstatus_PING_PACKET_HISTORY_LEN", PING_PACKET_HISTORY_LEN)
+CU = _env_str("serverstatus_CU", CU)
+CT = _env_str("serverstatus_CT", CT)
+CM = _env_str("serverstatus_CM", CM)
 
 def parse_cli_args(arguments):
     overrides = {}
@@ -243,6 +244,36 @@ def liuliang():
     with _net_lock:
         return _net_in, _net_out
 
+def _win_proc_thread_count():
+    """NtQuerySystemInformation(SystemProcessInformation)：一次系统调用拿全部进程/线程数。
+    与任务管理器同源，替代逐进程 psutil.Process().num_threads()（Windows 上极慢）。"""
+    import ctypes
+    from ctypes import wintypes
+    nqsi = ctypes.WinDLL('ntdll').NtQuerySystemInformation
+    nqsi.argtypes = [wintypes.ULONG, wintypes.LPVOID, wintypes.ULONG, ctypes.POINTER(wintypes.ULONG)]
+    nqsi.restype = wintypes.LONG
+    buf_size = 1 << 20          # 1MB 起
+    while True:
+        buf = ctypes.create_string_buffer(buf_size)
+        ret_len = wintypes.ULONG(0)
+        status = nqsi(5, buf, buf_size, ctypes.byref(ret_len))   # 5 = SystemProcessInformation
+        if status == 0:                                          # STATUS_SUCCESS
+            break
+        if status == 0xC0000004:                                 # STATUS_INFO_LENGTH_MISMATCH → 扩大重试
+            buf_size = ret_len.value + 0x10000
+            continue
+        return 0, 0
+    b = buf.raw
+    procs = threads = off = 0
+    while off < len(b):
+        nxt = int.from_bytes(b[off:off+4], 'little')
+        threads += int.from_bytes(b[off+4:off+8], 'little')      # NumberOfThreads
+        procs += 1
+        if nxt == 0:
+            break
+        off += nxt
+    return procs, threads
+
 def tupd():
     '''
     tcp, udp, process, thread count: for view ddcc attack , then send warning
@@ -266,11 +297,16 @@ def tupd():
                     pass
 
         elif sys.platform.startswith("win") is True:
-            t = int(os.popen('netstat -an|find "TCP" /c').read()[:-1])-1
-            u = int(os.popen('netstat -an|find "UDP" /c').read()[:-1])-1
-            p = len(psutil.pids())
-            # if you find cpu is high, please set d=0
-            d = sum([psutil.Process(k).num_threads() for k in psutil.pids()])
+            # Windows：走原生 API（与任务管理器同源），避免 netstat 管道 + 逐进程遍历（约 7s）
+            t = 0
+            u = 0
+            try:
+                t = len(psutil.net_connections(kind='tcp'))   # GetExtendedTcpTable
+                u = len(psutil.net_connections(kind='udp'))   # GetExtendedUdpTable
+            except Exception:
+                t = 0
+                u = 0
+            p, d = _win_proc_thread_count()                   # NtQuerySystemInformation
         else:
             t,u,p,d = 0,0,0,0
         return t,u,p,d
