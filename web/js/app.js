@@ -175,18 +175,25 @@ function lossValues(s){
   return [s.ping_10010, s.ping_189, s.ping_10086].map(p => clamp(num(p), 0, 100));
 }
 
+function osResourceThresholds(s){
+  const isWin = /win/i.test(String(s?.os || ''));
+  if(isWin) return { cpu:{warn:85,bad:95}, mem:{warn:85,bad:95}, swap:{warn:80,bad:90}, hdd:{warn:90,bad:97} };
+  return { cpu:{warn:75,bad:90}, mem:{warn:80,bad:90}, swap:{warn:80,bad:90}, hdd:{warn:85,bad:90} };
+}
+
 function metrics(s){
   const online = !!(s.online4 || s.online6);
   const memPct = s.memory_total ? s.memory_used / s.memory_total * 100 : 0;
   const hddPct = s.hdd_total ? s.hdd_used / s.hdd_total * 100 : 0;
+  const thresholds = osResourceThresholds(s);
   const monthIn = Math.max(0, num(s.network_in) - num(s.last_network_in));
   const monthOut = Math.max(0, num(s.network_out) - num(s.last_network_out));
   const traffic = monthIn + monthOut;
   const losses = lossValues(s);
   const loss = Math.max(...losses);
   const blocked = online && losses.every(p => p >= 100);
-  const resourceCritical = online && (num(s.cpu) >= 90 || memPct >= 90 || hddPct >= 90);
-  const resourceWarning = online && (num(s.cpu) >= 75 || memPct >= 80 || hddPct >= 85);
+  const resourceCritical = online && (num(s.cpu) >= thresholds.cpu.bad || memPct >= thresholds.mem.bad || hddPct >= thresholds.hdd.bad);
+  const resourceWarning = online && (num(s.cpu) >= thresholds.cpu.warn || memPct >= thresholds.mem.warn || hddPct >= thresholds.hdd.warn);
   const lossCritical = online && loss >= 40;
   const lossWarning = online && !lossCritical && loss >= 30;
   const critical = online && (resourceCritical || blocked || lossCritical);
@@ -423,13 +430,9 @@ function loadCellHTML(s){
   if(!cores) return esc(load);
   return `<span class="load-with-cores" title="负载 ${esc(load)} / CPU ${esc(cores)}"><span class="load-value">${esc(load)}</span><span class="load-core-bubble">${esc(cores)}</span></span>`;
 }
-function gaugeHTML(type, value){
+function gaugeHTML(type, value, s){
   const pct = clamp(num(value), 0, 100);
-  const thresholds = {
-    cpu: { warn: 75, bad: 90 },
-    mem: { warn: 80, bad: 90 },
-    hdd: { warn: 85, bad: 90 }
-  }[type] || { warn: 75, bad: 90 };
+  const thresholds = osResourceThresholds(s)[type] || { warn: 75, bad: 90 };
   const warnAttr = pct >= thresholds.bad ? 'data-bad' : (pct >= thresholds.warn ? 'data-warn' : '');
   const label = type === 'cpu' ? 'CPU' : type === 'mem' ? '内存' : '硬盘';
   return `<div class="gauge-half" data-type="${type}" ${warnAttr} style="--p:${(pct / 100).toFixed(3)}" title="${label} ${pct.toFixed(0)}%">
@@ -437,14 +440,9 @@ function gaugeHTML(type, value){
     <span>${pct.toFixed(0)}%</span>
   </div>`;
 }
-function resourceMeter(label, value, pct, kind){
+function resourceMeter(label, value, pct, kind, s){
   const safePct = clamp(num(pct), 0, 100);
-  const thresholds = {
-    cpu: { warn: 75, bad: 90 },
-    mem: { warn: 80, bad: 90 },
-    swap: { warn: 80, bad: 90 },
-    hdd: { warn: 85, bad: 90 }
-  }[kind] || { warn: 75, bad: 90 };
+  const thresholds = osResourceThresholds(s)[kind] || { warn: 75, bad: 90 };
   const level = safePct >= thresholds.bad ? 'bad' : (safePct >= thresholds.warn ? 'warn' : 'ok');
   return `<div class="resource-meter" data-kind="${esc(kind)}" data-level="${level}" style="--p:${safePct.toFixed(1)}%">
     <div class="resource-meter-head"><span>${esc(label)}</span><strong>${esc(value)}</strong></div>
@@ -454,10 +452,10 @@ function resourceMeter(label, value, pct, kind){
 function detailResourceHTML(s, m){
   const swapPct = s.swap_total ? num(s.swap_used) / num(s.swap_total) * 100 : 0;
   return `
-    ${resourceMeter('CPU', `${num(s.cpu).toFixed(0)}%`, num(s.cpu), 'cpu')}
-    ${resourceMeter('内存', `${humanMinMBFromKB(s.memory_used)} / ${humanMinMBFromKB(s.memory_total)}`, m.memPct, 'mem')}
-    ${resourceMeter('虚存', `${humanMinMBFromKB(s.swap_used)} / ${humanMinMBFromKB(s.swap_total)}`, swapPct, 'swap')}
-    ${resourceMeter('硬盘', `${humanMinMBFromMB(s.hdd_used)} / ${humanMinMBFromMB(s.hdd_total)}`, m.hddPct, 'hdd')}
+    ${resourceMeter('CPU', `${num(s.cpu).toFixed(0)}%`, num(s.cpu), 'cpu', s)}
+    ${resourceMeter('内存', `${humanMinMBFromKB(s.memory_used)} / ${humanMinMBFromKB(s.memory_total)}`, m.memPct, 'mem', s)}
+    ${resourceMeter('虚存', `${humanMinMBFromKB(s.swap_used)} / ${humanMinMBFromKB(s.swap_total)}`, swapPct, 'swap', s)}
+    ${resourceMeter('硬盘', `${humanMinMBFromMB(s.hdd_used)} / ${humanMinMBFromMB(s.hdd_total)}`, m.hddPct, 'hdd', s)}
     <div class="resource-mini"><span>IO</span><strong>读 ${humanMinMBFromB(s.io_read)} / 写 ${humanMinMBFromB(s.io_write)}</strong></div>`;
 }
 function packetLossLine(s){
@@ -499,9 +497,9 @@ function serverRowHTML(s, m, signature){
     <td>${loadCellHTML(s)}</td>
     <td>${netNow}</td>
     <td>${netTotal}</td>
-    <td>${m.online ? gaugeHTML('cpu', s.cpu) : '-'}</td>
-    <td>${m.online ? gaugeHTML('mem', m.memPct) : '-'}</td>
-    <td>${m.online ? gaugeHTML('hdd', m.hddPct) : '-'}</td>
+    <td>${m.online ? gaugeHTML('cpu', s.cpu, s) : '-'}</td>
+    <td>${m.online ? gaugeHTML('mem', m.memPct, s) : '-'}</td>
+    <td>${m.online ? gaugeHTML('hdd', m.hddPct, s) : '-'}</td>
     <td>${buckets(s)}</td>
   </tr>`;
 }
