@@ -261,34 +261,31 @@ _net_in = 0
 _net_out = 0
 _net_lock = threading.Lock()
 
+def _sum_physical_counters(net):
+    """按 is_virtual_nic 过滤后累加 (total_in, total_out)。
+    psutil pernic 值按 namedtuple 字段序，bytes_recv 下标 1、bytes_sent 下标 0。
+    抽成纯函数便于单测，不改变 _net_monitor 的单线程唯一调用设计。"""
+    total_in = 0
+    total_out = 0
+    for name, stats in (net or {}).items():
+        if is_virtual_nic(name):
+            continue
+        total_in += stats[1]
+        total_out += stats[0]
+    return total_in, total_out
+
 def _net_monitor():
     """独立线程：唯一调用 psutil.net_io_counters 的地方，读累计值存全局并算网速"""
     global _net_in, _net_out
-    prev_in = 0
-    prev_out = 0
-    prev_clock = 0
     while True:
         try:
-            total_in = 0
-            total_out = 0
-            net = psutil.net_io_counters(pernic=True)
-            for k, v in net.items():
-                if is_virtual_nic(k):
-                    continue
-                total_in += v[1]
-                total_out += v[0]
+            total_in, total_out = _sum_physical_counters(psutil.net_io_counters(pernic=True))
             with _net_lock:
                 _net_in = total_in
                 _net_out = total_out
-            now_clock = time.time()
-            if prev_clock > 0:
-                diff = now_clock - prev_clock
-                if diff > 0:
-                    netSpeed["netrx"] = int((total_in - prev_in) / diff)
-                    netSpeed["nettx"] = int((total_out - prev_out) / diff)
-            prev_in = total_in
-            prev_out = total_out
-            prev_clock = now_clock
+            # 用 update_net_speed 统一算速：time.monotonic 不受系统时钟回拨影响，
+            # 且对计数器回绕（total < prev）置 0，避免负数/异常尖峰
+            update_net_speed(total_in, total_out)
         except Exception:
             # 保留最后有效值，短暂等待后自动重试，避免线程永久退出
             pass
@@ -308,6 +305,32 @@ def _net_probe_thread():
         except Exception:
             _online_status[target] = False
         time.sleep(10)
+
+def get_os_name():
+    try:
+        sysname = platform.system().lower()
+        if sysname.startswith('windows'):
+            return 'windows'
+        if sysname.startswith('darwin') or 'mac' in sysname:
+            return 'darwin'
+        if 'bsd' in sysname:
+            return 'bsd'
+        if sysname.startswith('linux'):
+            os_name = 'linux'
+            try:
+                with open('/etc/os-release') as f:
+                    for line in f:
+                        if line.startswith('ID='):
+                            value = line.strip().split('=', 1)[1].strip().strip('"')
+                            if value:
+                                os_name = value
+                            break
+            except Exception:
+                pass
+            return os_name
+        return sysname or 'unknown'
+    except Exception:
+        return 'unknown'
 
 def liuliang():
     """主循环读取：只读独立线程存下的全局值，不调 psutil"""
@@ -550,6 +573,22 @@ diskIO = {
     'write': 0
 }
 monitorServer = {}
+
+def update_net_speed(avgrx, avgtx, now_clock=None):
+    if now_clock is None:
+        now_clock = time.monotonic()
+    previous_clock = netSpeed.get("clock", 0.0)
+    previous_rx = netSpeed.get("avgrx", 0)
+    previous_tx = netSpeed.get("avgtx", 0)
+    diff = now_clock - previous_clock
+    initialized = previous_clock > 0 and diff > 0
+    netSpeed["diff"] = diff if initialized else 0.0
+    netSpeed["clock"] = now_clock
+    netSpeed["netrx"] = int((avgrx - previous_rx) / diff) if initialized and avgrx >= previous_rx else 0
+    netSpeed["nettx"] = int((avgtx - previous_tx) / diff) if initialized and avgtx >= previous_tx else 0
+    netSpeed["avgrx"] = avgrx
+    netSpeed["avgtx"] = avgtx
+    return netSpeed["netrx"], netSpeed["nettx"]
 
 def _ping_thread(host, mark, port):
     lostPacket = 0
@@ -873,31 +912,7 @@ if __name__ == '__main__':
                 array['tcp'], array['udp'], array['process'], array['thread'] = tupd()
                 array['io_read'] = diskIO.get("read")
                 array['io_write'] = diskIO.get("write")
-                # report OS (normalized)
-                try:
-                    sysname = platform.system().lower()
-                    if sysname.startswith('windows'):
-                        os_name = 'windows'
-                    elif sysname.startswith('darwin') or 'mac' in sysname:
-                        os_name = 'darwin'
-                    elif 'bsd' in sysname:
-                        os_name = 'bsd'
-                    elif sysname.startswith('linux'):
-                        # try distro from os-release
-                        try:
-                            with open('/etc/os-release') as f:
-                                for line in f:
-                                    if line.startswith('ID='):
-                                        val = line.strip().split('=',1)[1].strip().strip('"')
-                                        if val: os_name = val
-                                        break
-                        except Exception:
-                            os_name = 'linux'
-                    else:
-                        os_name = sysname or 'unknown'
-                except Exception:
-                    os_name = 'unknown'
-                array['os'] = os_name
+                array['os'] = get_os_name()
                 items = []
                 for _n, st in monitorServer.items():
                     key = str(_n)

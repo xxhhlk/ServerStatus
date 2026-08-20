@@ -1,5 +1,9 @@
 default.sublime-workspace
 
+# Browser test dependencies and artifacts
+node_modules/
+output/
+
 # pycharm
 .idea
 
