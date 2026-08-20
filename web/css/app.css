@@ -138,11 +138,6 @@ body.light .load-core-bubble{background:color-mix(in srgb,var(--accent) 8%,#fff)
 	.topbar{flex-wrap:wrap;padding:.6rem .8rem}
 	.actions{width:100%;justify-content:flex-end;margin-top:.4rem}
 	.wrapper{padding:0 .7rem}
-	#panel-servers .table-wrap{display:none;}
-	#serversCards{display:grid!important;grid-template-columns:1fr;gap:.75rem;margin-top:.5rem;}
-	/* 服务与证书移动端卡片 */
-	#panel-monitors .table-wrap, #panel-ssl .table-wrap{display:none;}
-	#monitorsCards,#sslCards{display:grid!important;grid-template-columns:1fr;gap:.75rem;margin-top:.5rem;}
 	.modal-box{max-width:100%;border-radius:14px;padding:1rem .95rem;}
 	.modal-content{max-height:65vh;overflow:auto;}
 }
@@ -380,6 +375,11 @@ th[data-sort].sorted-desc:after{border-top-color:var(--accent);opacity:1}
 }
 @media (max-width:700px){
 	.ops-overview{display:none}
+	/* 卡片布局与 JS isCompactLayout()(innerWidth<=700) 对齐，避免 641-700px 面板空白 */
+	#panel-servers .table-wrap{display:none;}
+	#serversCards{display:grid!important;grid-template-columns:1fr;gap:.75rem;margin-top:.5rem;}
+	#panel-monitors .table-wrap, #panel-ssl .table-wrap{display:none;}
+	#monitorsCards,#sslCards{display:grid!important;grid-template-columns:1fr;gap:.75rem;margin-top:.5rem;}
 }
 @media (max-width:640px){
 	.ops-toolbar{align-items:stretch}
