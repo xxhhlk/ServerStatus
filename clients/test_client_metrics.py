@@ -126,6 +126,49 @@ veth123: 8000 8 0 0 0 0 0 0 8000 8 0 0 0 0 0 0
             for name in ("lo", "ifb0", "tailscale0", "docker0", "veth123", "br-abc", "bond0"):
                 self.assertFalse(predicate(name), name)
 
+    def test_interface_filter_keeps_wlo_and_excludes_virtual_interfaces(self):
+        """回归：名字子串匹配 'lo' in k 会误杀 wlo1 无线网卡（上游 050b107 修复点）。
+        本分支改用 sysfs 物理性判定，天然不受子串误杀影响。"""
+        client_linux = load_client("client-linux.py")
+        client_psutil = load_client("client-psutil.py")
+        # wlo1/wlan0 无线网卡必须计入；lo 及各类虚拟接口必须排除
+        device_links = {
+            client_linux["os"].path.join("/sys/class/net", name, "device")
+            for name in ("eth0", "wlo1", "enp3s0")
+        }
+        with mock.patch.object(client_linux["os"].path, "exists",
+                               side_effect=lambda path: path in device_links):
+            for name in ("wlo1", "eth0", "enp3s0"):
+                self.assertTrue(client_linux["_is_physical_interface"](name), name)
+            for name in ("lo", "lo0", "tun0", "docker0", "veth123", "br-test", "vmbr0",
+                         "vnet0", "kube-ipvs0", "ifb0", "tailscale0"):
+                self.assertFalse(client_linux["_is_physical_interface"](name), name)
+
+        psutil_links = {"/sys/class/net/eth0/device", "/sys/class/net/wlo1/device"}
+        with mock.patch.object(client_psutil["sys"], "platform", "linux"), \
+                mock.patch.object(client_psutil["os"], "access", return_value=True), \
+                mock.patch.object(client_psutil["os"].path, "exists",
+                                  side_effect=lambda path: path in psutil_links):
+            for name in ("wlo1", "eth0"):
+                self.assertFalse(client_psutil["is_virtual_nic"](name), name)
+            for name in ("lo", "lo0", "tun0", "docker0", "veth123", "ifb0", "tailscale0"):
+                self.assertTrue(client_psutil["is_virtual_nic"](name), name)
+
+    def test_linux_totals_keep_one_way_interfaces(self):
+        """回归：旧实现丢弃 rx==0 或 tx==0 的接口，会漏掉单向链路（上游 050b107 修复点）。
+        本分支保留该行为：只按物理性过滤，不再按单向零值过滤。"""
+        client = load_client("client-linux.py")
+        proc_net_dev = """Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+  eth0: 1000 10 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+  ens5: 0 0 0 0 0 0 0 0 300 3 0 0 0 0 0 0
+"""
+        physical = {"eth0", "ens5"}
+        with mock.patch("builtins.open", mock.mock_open(read_data=proc_net_dev)), \
+                mock.patch.dict(client["liuliang"].__globals__,
+                                {"_is_physical_interface": lambda name: name in physical}):
+            self.assertEqual(client["liuliang"](), (1000, 300))
+
     # --- 网速 -------------------------------------------------------------
 
     def test_network_speed_starts_and_resets_at_zero(self):

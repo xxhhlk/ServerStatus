@@ -360,8 +360,6 @@ def _win_proc_thread_count():
             break
         if status == 0xC0000004:                                 # STATUS_INFO_LENGTH_MISMATCH → 扩大重试
             buf_size = ret_len.value + 0x10000
-            continue
-        return 0, 0
     b = buf.raw
     procs = threads = off = 0
     while off < len(b):

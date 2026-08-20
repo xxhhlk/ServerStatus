@@ -246,6 +246,16 @@ def get_os_name():
     except Exception:
         return 'unknown'
 
+def is_ignored_network_interface(name):
+    name = str(name or '').strip().lower()
+    is_loopback = (
+        name == 'lo'
+        or (name.startswith('lo') and name[2:].isdigit())
+        or name.startswith('loopback')
+    )
+    virtual_prefixes = ('tun', 'docker', 'veth', 'br-', 'vmbr', 'vnet', 'kube')
+    return not name or is_loopback or name.startswith(virtual_prefixes)
+
 def liuliang():
     NET_IN = 0
     NET_OUT = 0
@@ -256,8 +266,8 @@ def liuliang():
                 iface = netinfo[0][0]
                 if not _is_physical_interface(iface):
                     continue
-                if netinfo[0][1] == '0' or netinfo[0][9] == '0':
-                    continue
+                # 不再按「rx==0 或 tx==0」丢弃接口：单向链路（只收或只发）会被漏计。
+                # 零值接口累加 0 本身无副作用，由 _is_physical_interface 负责过滤虚拟网卡。
                 NET_IN += int(netinfo[0][1])
                 NET_OUT += int(netinfo[0][9])
     return NET_IN, NET_OUT
