@@ -425,6 +425,8 @@ def _win_pdh_queue_length():
     # 0x400 = PDH_FMT_LARGE：union 按 8 字节 LARGE_INTEGER 读，与结构布局一致
     if pdh.PdhGetFormattedCounterValue(counter, 0x400, ctypes.byref(ctype), ctypes.byref(value)) != 0:
         return None
+    if value.CStatus not in (0, 1):   # PDH_CSTATUS_VALID_DATA / NEW_DATA，其余为无效/待更新
+        return None
     return max(0, value.value)
 
 def _win_load_thread():
