@@ -352,7 +352,7 @@ def _win_proc_thread_count():
 
 # --- Windows 负载（load average 近似） ---
 # 就绪队列长度用文档化 PDH 计数器 \System\Processor Queue Length（所有处理器就绪队列线程数之和），
-# 运行线程数按核估算（每核 CPU 利用率 >90% 几乎占满才记为 1 个运行线程，用 SystemProcessorPerformanceInformation）。
+# 运行线程数用每核 CPU 利用率连续求和（单核利用率 60% 记 0.6，用 SystemProcessorPerformanceInformation 采样）。
 # 1/5/15 分钟用内核同款指数衰减 EWMA：load = prev*exp(-dt/tau) + instant*(1-exp(-dt/tau))。
 _win_load_averages = [0.0, 0.0, 0.0]          # [1min, 5min, 15min]，主循环只读快照
 _win_load_lock = threading.Lock()
@@ -429,30 +429,32 @@ def _win_pdh_queue_length():
 
 def _win_load_thread():
     """独立线程：每 5s 采一次瞬时负载，做 1/5/15 分钟 EWMA，主循环只读快照。
-    瞬时负载 = 就绪队列线程数 + 运行线程数（每核 CPU 利用率 >90% 几乎占满才记为 1 个运行线程，
-    避免桌面机后台杂活把每个核都算成"有线程在跑"导致负载虚高）。
-    启动后 2 分钟为 warm-up：直接报瞬时值，避免 PDH 数据未就绪/active 无基线时
+    瞬时负载 = 就绪队列线程数 + Σ(每核 CPU 利用率)（连续值，与 Linux 语义一致：
+    单核跑满记 1、利用率 60% 记 0.6，避免离散阈值在中等负载区间低估）。
+    启动后 2 分钟为 warm-up：直接报瞬时值，避免 PDH 数据未就绪/无基线时
     把起点钉在 0，导致监控读数从 0 缓慢爬升。"""
     tau = (60.0, 300.0, 900.0)
     prev_idle = None
     prev_clock = 0.0
     warm_until = time.time() + 120
-    _win_pdh_init()   # PDH 不可用时就绪队列恒 0，负载退化为满载核数
+    _win_pdh_init()   # PDH 不可用时就绪队列恒 0，负载退化为 Σ利用率
     while True:
         try:
             qlen = _win_pdh_queue_length()
             perfs = _win_perf_snapshot()
             if perfs is not None or qlen is not None:
-                active = 0
+                running = 0.0
                 if perfs is not None and prev_idle is not None:
                     for cur, prev in zip(perfs, prev_idle):
-                        busy = (cur.KernelTime - prev.KernelTime) + (cur.UserTime - prev.UserTime)
-                        total = busy + (cur.IdleTime - prev.IdleTime)
-                        if total > 0 and busy * 10 > total * 9:
-                            active += 1
+                        # 注意：KernelTime 包含 IdleTime，必须先减掉再算内核忙碌时间
+                        idle = cur.IdleTime - prev.IdleTime
+                        busy = (cur.KernelTime - prev.KernelTime) - idle + (cur.UserTime - prev.UserTime)
+                        total = busy + idle
+                        if total > 0:
+                            running += busy / total
                 if perfs is not None:
                     prev_idle = perfs
-                instant = (qlen or 0) + active
+                instant = (qlen or 0) + running
                 now = time.time()
                 if now < warm_until:
                     with _win_load_lock:
