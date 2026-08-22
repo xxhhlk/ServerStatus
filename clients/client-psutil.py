@@ -28,6 +28,9 @@ import sys
 import subprocess
 import json
 import errno
+import math
+import ctypes
+from ctypes import wintypes
 import psutil
 import threading
 import platform
@@ -311,14 +314,20 @@ def liuliang():
     with _net_lock:
         return _net_in, _net_out
 
+def _win_nqsi():
+    """ntdll.NtQuerySystemInformation，惰性初始化一次（全部 Windows 原生采样共用）"""
+    fn = getattr(_win_nqsi, 'fn', None)
+    if fn is None:
+        fn = ctypes.WinDLL('ntdll').NtQuerySystemInformation
+        fn.argtypes = [wintypes.ULONG, wintypes.LPVOID, wintypes.ULONG, ctypes.POINTER(wintypes.ULONG)]
+        fn.restype = wintypes.LONG
+        _win_nqsi.fn = fn
+    return fn
+
 def _win_proc_thread_count():
     """NtQuerySystemInformation(SystemProcessInformation)：一次系统调用拿全部进程/线程数。
     与任务管理器同源，替代逐进程 psutil.Process().num_threads()（Windows 上极慢）。"""
-    import ctypes
-    from ctypes import wintypes
-    nqsi = ctypes.WinDLL('ntdll').NtQuerySystemInformation
-    nqsi.argtypes = [wintypes.ULONG, wintypes.LPVOID, wintypes.ULONG, ctypes.POINTER(wintypes.ULONG)]
-    nqsi.restype = wintypes.LONG
+    nqsi = _win_nqsi()
     buf_size = 1 << 20          # 1MB 起
     while True:
         buf = ctypes.create_string_buffer(buf_size)
@@ -340,6 +349,122 @@ def _win_proc_thread_count():
             break
         off += nxt
     return procs, threads
+
+# --- Windows 负载（load average 近似） ---
+# 就绪队列长度用文档化 PDH 计数器 \System\Processor Queue Length（所有处理器就绪队列线程数之和），
+# 运行线程数按核估算（每核 CPU 利用率 >1% 记为 1 个运行线程，用 SystemProcessorPerformanceInformation）。
+# 1/5/15 分钟用内核同款指数衰减 EWMA：load = prev*exp(-dt/tau) + instant*(1-exp(-dt/tau))。
+_win_load_averages = [0.0, 0.0, 0.0]          # [1min, 5min, 15min]，主循环只读快照
+_win_load_lock = threading.Lock()
+
+class _WIN_PERF_INFO(ctypes.Structure):
+    """SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION：每核 idle/kernel/user 时间，48 字节"""
+    _fields_ = [
+        ('IdleTime', ctypes.c_ulonglong),
+        ('KernelTime', ctypes.c_ulonglong),
+        ('UserTime', ctypes.c_ulonglong),
+        ('DpcTime', ctypes.c_ulonglong),
+        ('InterruptTime', ctypes.c_ulonglong),
+        ('InterruptCount', ctypes.c_ulong),
+    ]
+
+def _win_perf_snapshot():
+    """SystemProcessorPerformanceInformation (8)：每核 idle/kernel/user 时间。失败返回 None"""
+    nqsi = _win_nqsi()
+    nproc = psutil.cpu_count(logical=True) or 1
+    perfs = (_WIN_PERF_INFO * nproc)()
+    ret_len = wintypes.ULONG(0)
+    if nqsi(8, perfs, ctypes.sizeof(perfs), ctypes.byref(ret_len)) != 0:
+        return None
+    return list(perfs[:ret_len.value // ctypes.sizeof(_WIN_PERF_INFO)])
+
+_pdh = None
+_pdh_query = None
+_pdh_counter = None
+
+class _PDH_FMT_COUNTERVALUE(ctypes.Structure):
+    _fields_ = [('CStatus', wintypes.LONG), ('value', ctypes.c_longlong)]
+
+def _win_pdh_init():
+    global _pdh, _pdh_query, _pdh_counter
+    if _pdh is not None:
+        return True
+    try:
+        pdh = ctypes.WinDLL('pdh')
+        pdh.PdhOpenQueryW.argtypes = [wintypes.LPCWSTR, ctypes.c_size_t, ctypes.POINTER(wintypes.HANDLE)]
+        pdh.PdhOpenQueryW.restype = wintypes.LONG
+        pdh.PdhAddEnglishCounterW.argtypes = [wintypes.HANDLE, wintypes.LPCWSTR, ctypes.c_size_t, ctypes.POINTER(wintypes.HANDLE)]
+        pdh.PdhAddEnglishCounterW.restype = wintypes.LONG
+        pdh.PdhCollectQueryData.argtypes = [wintypes.HANDLE]
+        pdh.PdhCollectQueryData.restype = wintypes.LONG
+        pdh.PdhGetFormattedCounterValue.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                                    ctypes.POINTER(wintypes.DWORD),
+                                                    ctypes.POINTER(_PDH_FMT_COUNTERVALUE)]
+        pdh.PdhGetFormattedCounterValue.restype = wintypes.LONG
+        query = wintypes.HANDLE()
+        counter = wintypes.HANDLE()
+        if pdh.PdhOpenQueryW(None, 0, ctypes.byref(query)) != 0:
+            return False
+        if pdh.PdhAddEnglishCounterW(query, "\\System\\Processor Queue Length", 0, ctypes.byref(counter)) != 0:
+            return False
+        pdh.PdhCollectQueryData(query)   # 首次采集仅初始化，数据下一轮就绪
+        _pdh, _pdh_query, _pdh_counter = pdh, query, counter
+        return True
+    except Exception:
+        return False
+
+def _win_pdh_queue_length():
+    """当前就绪队列线程数；PDH 数据未就绪/失败返回 None"""
+    if _pdh is None:
+        return None
+    pdh, query, counter = _pdh, _pdh_query, _pdh_counter
+    if pdh.PdhCollectQueryData(query) != 0:
+        return None
+    value = _PDH_FMT_COUNTERVALUE()
+    ctype = wintypes.DWORD(0)
+    # 0x400 = PDH_FMT_LARGE：union 按 8 字节 LARGE_INTEGER 读，与结构布局一致
+    if pdh.PdhGetFormattedCounterValue(counter, 0x400, ctypes.byref(ctype), ctypes.byref(value)) != 0:
+        return None
+    return max(0, value.value)
+
+def _win_load_thread():
+    """独立线程：每 5s 采一次瞬时负载，做 1/5/15 分钟 EWMA，主循环只读快照。
+    瞬时负载 = 就绪队列线程数 + 运行线程数（每核 CPU 利用率 >1% 记为 1 个运行线程）。"""
+    tau = (60.0, 300.0, 900.0)
+    prev_idle = None
+    prev_clock = 0.0
+    _win_pdh_init()   # PDH 不可用时就绪队列恒 0，负载退化为运行线程数
+    while True:
+        try:
+            qlen = _win_pdh_queue_length()
+            perfs = _win_perf_snapshot()
+            if perfs is not None or qlen is not None:
+                active = 0
+                if perfs is not None and prev_idle is not None:
+                    for cur, prev in zip(perfs, prev_idle):
+                        busy = (cur.KernelTime - prev.KernelTime) + (cur.UserTime - prev.UserTime)
+                        total = busy + (cur.IdleTime - prev.IdleTime)
+                        if total > 0 and busy * 100 > total:
+                            active += 1
+                if perfs is not None:
+                    prev_idle = perfs
+                instant = (qlen or 0) + active
+                now = time.time()
+                if prev_clock > 0:
+                    dt = now - prev_clock
+                    avg = list(_win_load_averages)
+                    for i, t in enumerate(tau):
+                        f = math.exp(-dt / t)
+                        avg[i] = avg[i] * f + instant * (1.0 - f)
+                    with _win_load_lock:
+                        _win_load_averages[:] = avg
+                else:
+                    with _win_load_lock:
+                        _win_load_averages[:] = [float(instant)] * 3
+                prev_clock = now
+        except Exception:
+            pass
+        time.sleep(5)
 
 def tupd():
     '''
@@ -547,7 +672,10 @@ def get_realtime_data():
     t6 = threading.Thread(
         target=_net_probe_thread,
     )
-    for ti in [t1, t2, t3, t4, t5, t6]:
+    threads = [t1, t2, t3, t4, t5, t6]
+    if sys.platform.startswith('win'):
+        threads.append(threading.Thread(target=_win_load_thread))
+    for ti in threads:
         ti.daemon = True
         ti.start()
 
@@ -694,7 +822,13 @@ if __name__ == '__main__':
                 CPU = get_cpu()
                 NET_IN, NET_OUT = liuliang()
                 Uptime = get_uptime()
-                Load_1, Load_5, Load_15 = os.getloadavg() if 'linux' in sys.platform or 'darwin' in sys.platform else (0.0, 0.0, 0.0)
+                if 'linux' in sys.platform or 'darwin' in sys.platform:
+                    Load_1, Load_5, Load_15 = os.getloadavg()
+                elif sys.platform.startswith('win'):
+                    with _win_load_lock:
+                        Load_1, Load_5, Load_15 = _win_load_averages
+                else:
+                    Load_1, Load_5, Load_15 = 0.0, 0.0, 0.0
                 MemoryTotal, MemoryUsed = get_memory()
                 SwapTotal, SwapUsed = get_swap()
                 HDDTotal, HDDUsed = get_hdd()
