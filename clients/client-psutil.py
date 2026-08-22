@@ -352,7 +352,7 @@ def _win_proc_thread_count():
 
 # --- Windows 负载（load average 近似） ---
 # 就绪队列长度用文档化 PDH 计数器 \System\Processor Queue Length（所有处理器就绪队列线程数之和），
-# 运行线程数按核估算（每核 CPU 利用率 >1% 记为 1 个运行线程，用 SystemProcessorPerformanceInformation）。
+# 运行线程数按核估算（每核 CPU 利用率 >90% 几乎占满才记为 1 个运行线程，用 SystemProcessorPerformanceInformation）。
 # 1/5/15 分钟用内核同款指数衰减 EWMA：load = prev*exp(-dt/tau) + instant*(1-exp(-dt/tau))。
 _win_load_averages = [0.0, 0.0, 0.0]          # [1min, 5min, 15min]，主循环只读快照
 _win_load_lock = threading.Lock()
@@ -429,11 +429,12 @@ def _win_pdh_queue_length():
 
 def _win_load_thread():
     """独立线程：每 5s 采一次瞬时负载，做 1/5/15 分钟 EWMA，主循环只读快照。
-    瞬时负载 = 就绪队列线程数 + 运行线程数（每核 CPU 利用率 >1% 记为 1 个运行线程）。"""
+    瞬时负载 = 就绪队列线程数 + 运行线程数（每核 CPU 利用率 >90% 几乎占满才记为 1 个运行线程，
+    避免桌面机后台杂活把每个核都算成"有线程在跑"导致负载虚高）。"""
     tau = (60.0, 300.0, 900.0)
     prev_idle = None
     prev_clock = 0.0
-    _win_pdh_init()   # PDH 不可用时就绪队列恒 0，负载退化为运行线程数
+    _win_pdh_init()   # PDH 不可用时就绪队列恒 0，负载退化为满载核数
     while True:
         try:
             qlen = _win_pdh_queue_length()
@@ -444,7 +445,7 @@ def _win_load_thread():
                     for cur, prev in zip(perfs, prev_idle):
                         busy = (cur.KernelTime - prev.KernelTime) + (cur.UserTime - prev.UserTime)
                         total = busy + (cur.IdleTime - prev.IdleTime)
-                        if total > 0 and busy * 100 > total:
+                        if total > 0 and busy * 10 > total * 9:
                             active += 1
                 if perfs is not None:
                     prev_idle = perfs
