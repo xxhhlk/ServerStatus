@@ -3,4 +3,8 @@ default.sublime-workspace
 # pycharm
 .idea
 
+# python
+__pycache__/
+*.pyc
+
 *codebuddy*
