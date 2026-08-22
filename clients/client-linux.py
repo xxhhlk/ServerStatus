@@ -247,7 +247,7 @@ def get_network(ip_version):
     elif(ip_version == 6):
         HOST = "ipv6.ip.sb"
     try:
-        socket.create_connection((HOST, 80), 2).close()
+        socket.create_connection((HOST, PROBEPORT), 2).close()
         return True
     except:
         return False
