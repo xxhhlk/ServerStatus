@@ -430,10 +430,13 @@ def _win_pdh_queue_length():
 def _win_load_thread():
     """独立线程：每 5s 采一次瞬时负载，做 1/5/15 分钟 EWMA，主循环只读快照。
     瞬时负载 = 就绪队列线程数 + 运行线程数（每核 CPU 利用率 >90% 几乎占满才记为 1 个运行线程，
-    避免桌面机后台杂活把每个核都算成"有线程在跑"导致负载虚高）。"""
+    避免桌面机后台杂活把每个核都算成"有线程在跑"导致负载虚高）。
+    启动后 2 分钟为 warm-up：直接报瞬时值，避免 PDH 数据未就绪/active 无基线时
+    把起点钉在 0，导致监控读数从 0 缓慢爬升。"""
     tau = (60.0, 300.0, 900.0)
     prev_idle = None
     prev_clock = 0.0
+    warm_until = time.time() + 120
     _win_pdh_init()   # PDH 不可用时就绪队列恒 0，负载退化为满载核数
     while True:
         try:
@@ -451,7 +454,10 @@ def _win_load_thread():
                     prev_idle = perfs
                 instant = (qlen or 0) + active
                 now = time.time()
-                if prev_clock > 0:
+                if now < warm_until:
+                    with _win_load_lock:
+                        _win_load_averages[:] = [float(instant)] * 3
+                elif prev_clock > 0:
                     dt = now - prev_clock
                     avg = list(_win_load_averages)
                     for i, t in enumerate(tau):
