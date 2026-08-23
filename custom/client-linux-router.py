@@ -4,6 +4,7 @@
 # 版本：1.1.0, 支持Python版本：3.6+
 # 支持操作系统： Linux, OSX, FreeBSD, OpenBSD and NetBSD, both 32-bit and 64-bit architectures
 # 说明: 默认情况下修改server和user就可以了。丢包率监测方向可以自定义，例如：CU = "www.facebook.com"。
+# 华硕路由器：自动读取 nvram productid（如 RT-BE88U）并对照内置型号-SoC 表显示芯片型号（如 BCM4916）。
 # ============ 路由器定制（基于官方 1.1.0 重建） ============
 # - 流量/速率只统计 wan0 接口，避免内网 LAN 流量计入
 # - 流量带持久化状态文件，光猫/路由器重启后计数器不归零（封口累计）
@@ -214,6 +215,184 @@ def get_cpu_model():
     if vendor:
         return vendor
     return normalize_cpu_model(lscpu.get('architecture') or platform.machine() or platform.processor())
+
+# ============ 华硕路由器型号-SoC 映射表 ============
+# 数据源: asus_routers_spec_soc_full.xlsx（131 款华硕路由器）
+# 键: nvram productid 规范化（大写 + 去非字母数字），如 RT-BE88U -> RTBE88U
+# 值: 芯片型号（统一风格，仅芯片名，多芯片用 + 连接）
+ASUS_SOC_MAP = {
+    'BD4': 'IPQ5322',
+    'BD4OUTDOOR': 'IPQ5322',
+    'BD5': 'IPQ5322',
+    'BD5OUTDOOR': 'IPQ5322',
+    'BE14000': 'MT7988DV',
+    'BE30000': 'BCM4916',
+    'BE3600': 'IPQ5322',
+    'BE5000': 'IPQ5322',
+    'BLUECAVE': 'GRX350',
+    'BQ16': 'BCM4916',
+    'BQ16PRO': 'BCM4916',
+    'BRTAC828': 'IPQ8065',
+    'BT10': 'BCM6766',
+    'BT6': 'MT7988DV',
+    'BT8': 'MT7988DV',
+    'BT8P': 'MT7988DV',
+    'CT8': 'IPQ4019',
+    'DSLAC68U': 'BCM4708A0+MT7510',
+    'DSLAC88U': 'BCM63138+BCM4366E',
+    'DSLAX82U': 'BCM6750+BCM43684',
+    'ET12': 'BCM4912',
+    'ET8': 'BCM6755',
+    'ET9': 'BCM6756+BCM6715',
+    'GS7': 'MT7988DV',
+    'GS7AIR': 'MT7987A',
+    'GS7PRO': 'BCM6766',
+    'GSAX3000': 'BCM6750',
+    'GSAX5400': 'BCM6750',
+    'GSBE12000': 'BCM6766',
+    'GSBE18000': 'BCM6766',
+    'GSBE7200X': 'MT7988DV',
+    'GT6': 'BCM6753',
+    'GTAC2900': 'BCM4906',
+    'GTAC5300': 'BCM4908+BCM4366E',
+    'GTAX11000': 'BCM4908',
+    'GTAX11000PRO': 'BCM4912',
+    'GTAX6000': 'BCM4912',
+    'GTAXE11000': 'BCM4908',
+    'GTAXE16000': 'BCM4912',
+    'GTBE19000': 'BCM4916',
+    'GTBE19000AI': 'BCM4916',
+    'GTBE25000': 'BCM4916',
+    'GTBE96': 'BCM4916',
+    'GTBE96AI': 'BCM4916',
+    'GTBE98': 'BCM4916',
+    'GTBE98PRO': 'BCM4916',
+    'LYRAVOICE': 'IPQ4019',
+    'RTAC1200': 'MT7628AN',
+    'RTAC1200G': 'BCM47189',
+    'RTAC1200HP': 'MT7620A',
+    'RTAC1200V2': 'MT7628DAN',
+    'RTAC1900': 'BCM4708A0',
+    'RTAC1900P': 'BCM4709C0',
+    'RTAC3100': 'BCM47094',
+    'RTAC3200': 'BCM4709A0',
+    'RTAC51U': 'MT7620A',
+    'RTAC52U': 'MT7620A',
+    'RTAC53': 'MT7620A',
+    'RTAC5300': 'BCM4709C0',
+    'RTAC55UHP': 'QCA9557',
+    'RTAC57UV3': 'QCN5502',
+    'RTAC58UV2': 'QCN5502',
+    'RTAC58UV3': 'QCN5502',
+    'RTAC59U': 'QCN5502',
+    'RTAC59UV2': 'QCN5502',
+    'RTAC65P': 'MT7621AT',
+    'RTAC66UB1': 'BCM4708C0',
+    'RTAC68U': 'BCM4708A0',
+    'RTAC85P': 'MT7621AT',
+    'RTAC86U': 'BCM4906',
+    'RTAC87U': 'BCM4709A0',
+    'RTAC88U': 'BCM4709C0',
+    'RTACRH12': 'QCN5502',
+    'RTACRH13': 'IPQ4018+IPQ4019',
+    'RTAX1800': 'MT7621AT',
+    'RTAX1800HP': 'MT7621AT',
+    'RTAX1800PLUS': 'BCM6755',
+    'RTAX1800S': 'MT7621AT',
+    'RTAX3000': 'BCM6750',
+    'RTAX3000P': 'BCM6756',
+    'RTAX3000S': 'MT7981B',
+    'RTAX52': 'MT7981BA',
+    'RTAX52PRO': 'Filogic 820',
+    'RTAX53U': 'MT7621AT',
+    'RTAX54': 'MT7621AT+MT7981B',
+    'RTAX5400': 'BCM6750+BCM6715',
+    'RTAX54HP': 'MT7621AT+MT7981B',
+    'RTAX55': 'BCM6755',
+    'RTAX56U': 'BCM6755',
+    'RTAX56UV2': 'BCM6755',
+    'RTAX57': 'BCM6756',
+    'RTAX57GO': 'MT7981BA',
+    'RTAX57M': 'BCM6756',
+    'RTAX58U': 'BCM6750',
+    'RTAX58UV2': 'BCM6755',
+    'RTAX59U': 'MT7986AV',
+    'RTAX68U': 'BCM4906',
+    'RTAX82U': 'BCM6750',
+    'RTAX82UV2': 'BCM6750+BCM6715',
+    'RTAX86S': 'BCM4906',
+    'RTAX86U': 'BCM4908',
+    'RTAX86UPRO': 'BCM4912',
+    'RTAX88U': 'BCM4908',
+    'RTAX88UPRO': 'BCM4912',
+    'RTAX89X': 'IPQ8074A',
+    'RTAX92U': 'BCM4906',
+    'RTAXE7800': 'BCM6756',
+    'RTBE14000': 'MT7988DV',
+    'RTBE18000': 'BCM6766',
+    'RTBE3600': 'BCM6764L',
+    'RTBE50': 'IPQ5312',
+    'RTBE55': 'BCM6764',
+    'RTBE57': 'IPQ5312',
+    'RTBE58GO': 'BCM6764',
+    'RTBE58U': 'BCM6764L',
+    'RTBE58UV2': 'BCM6764',
+    'RTBE7200': 'MT7988DV',
+    'RTBE82U': 'BCM6766',
+    'RTBE86U': 'BCM4916',
+    'RTBE88U': 'BCM4916',
+    'RTBE90U': 'IPQ5322',
+    'RTBE92U': 'BCM6765',
+    'RTBE9400': 'IPQ5322',
+    'RTBE96U': 'BCM4916',
+    'RTBE9700': 'BCM6765',
+    'TUFAX3000': 'BCM6750',
+    'TUFAX3000V2': 'BCM6756',
+    'TUFAX4200': 'MT7986A',
+    'TUFAX4200Q': 'MT7986A',
+    'TUFAX5400': 'BCM6750',
+    'TUFAX6000': 'MT7986AV',
+    'TUFBE3600': 'BCM6764L',
+    'TUFBE3600V1': 'BCM6764L',
+    'TUFBE3600V2': 'BCM6764',
+    'TUFBE6500': 'IPQ5322',
+    'TUFBE9400': 'IPQ5322',
+    'TXAX6000': 'MT7986A',
+    'XC5': 'BCM6756',
+    'XD4': 'BCM6755',
+    'XD4PLUS': 'MT7621A',
+    'XD4S': 'QCA9557+QCA9563',
+    'XD5': 'BCM6756',
+    'XD6': 'BCM6750',
+    'XD6S': 'QCN5502',
+    'XT12': 'BCM4912',
+    'XT8': 'BCM6755',
+    'XT9': 'BCM6756',
+}
+
+def _get_nvram_productid():
+    """读取华硕 nvram 商品型号（如 RT-BE88U）；无 nvram 命令/读取失败返回 None"""
+    try:
+        out = subprocess.check_output(['nvram', 'get', 'productid'], timeout=2, stderr=subprocess.DEVNULL)
+        pid = out.decode(errors='ignore').strip()
+        return pid or None
+    except Exception:
+        return None
+
+def get_cpu_model_display():
+    """cpu_model 显示策略：
+    1. 华硕路由器：nvram productid 命中 ASUS_SOC_MAP -> 返回芯片型号（如 BCM4916）
+    2. 未收录型号：返回 'productid (原 lscpu/cpuinfo 结果)'，型号和芯片都展示
+    3. 非华硕/读不到 nvram：返回原 get_cpu_model() 结果"""
+    pid = _get_nvram_productid()
+    fallback = get_cpu_model()
+    if pid:
+        key = re.sub(r'[^a-zA-Z0-9]', '', pid).upper()
+        soc = ASUS_SOC_MAP.get(key)
+        if soc:
+            return soc
+        return '%s (%s)' % (pid, fallback)
+    return fallback
 
 def liuliang():
     # 路由器定制：只统计 wan0 接口（路由器 WAN 口，避免把内网/LAN 流量算进去）
@@ -634,7 +813,7 @@ if __name__ == '__main__':
 
             _online_target = check_ip
             CPUCores = get_cpu_cores()
-            CPUModel = get_cpu_model()
+            CPUModel = get_cpu_model_display()
             while True:
                 CPU = get_cpu()
                 NET_IN, NET_OUT = liuliang()
