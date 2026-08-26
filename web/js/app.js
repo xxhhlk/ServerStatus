@@ -369,7 +369,7 @@ function alertStats(){
 }
 
 function normalizeServersToolbarState(){
-  const show = S.activeTab === 'servers' && S.servers.length > 10;
+  const show = S.activeTab === 'servers' && S.servers.length > 20;
   $('serversToolbar').style.display = show ? 'flex' : 'none';
 }
 
