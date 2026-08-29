@@ -7,7 +7,7 @@ ServerStatus 是一个轻量的服务器探针和云监控面板，支持多节�
 [![Go](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
 [![CI](https://github.com/cppla/ServerStatus/actions/workflows/ci.yml/badge.svg)](https://github.com/cppla/ServerStatus/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-4EB1BA.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-2.0.0-red)](https://github.com/cppla/ServerStatus)
+[![Version](https://img.shields.io/badge/Version-2.0.0-red)](https://github.com/xxhhlk/ServerStatus)
 
 ![ServerStatus WebUI](https://dl.cpp.la/Archive/serverstatus_2_0_0.webp)
 
@@ -23,7 +23,7 @@ ADMIN_TOKEN='your-strong-token' docker compose -f docker-compose-server.yml up -
 # Docker Run
 wget -qO ~/serverstatus-config.json \
   --header='Accept: application/vnd.github.raw' \
-  'https://api.github.com/repos/cppla/ServerStatus/contents/server/config.json?ref=master'
+  'https://api.github.com/repos/xxhhlk/ServerStatus/contents/server/config.json?ref=master'
 mkdir -p ~/serverstatus-data
 
 docker run -d --restart=always --name=serverstatus-server \
@@ -65,7 +65,7 @@ docker run -d --restart=always --name=serverstatus-client \
 ```bash
 # Shell Run
 wget -qO client-linux.py --header='Accept: application/vnd.github.raw' \
-  'https://api.github.com/repos/cppla/ServerStatus/contents/clients/client-linux.py?ref=master'
+  'https://api.github.com/repos/xxhhlk/ServerStatus/contents/clients/client-linux.py?ref=master'
 nohup python3 client-linux.py SERVER=127.0.0.1 USER=s01 PASSWORD=USER_DEFAULT_PASSWORD >/dev/null 2>&1 &
 ```
 
