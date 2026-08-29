@@ -119,11 +119,11 @@ def get_hdd():
     return int(size / 1024 / 1024), int(used / 1024 / 1024)
 
 def get_time():
+    # 取 /proc/stat 第一行全部字段: user nice system idle iowait irq softirq steal guest guest_nice
+    # 用 split() 自动处理多空格；旧版 split(' ')[2:6] 会漏掉 iowait，导致 IO 等待高的机器 CPU 虚高
     with open("/proc/stat", "r") as f:
-        time_list = f.readline().split(' ')[2:6]
-        for i in range(len(time_list))  :
-            time_list[i] = int(time_list[i])
-        return time_list
+        fields = f.readline().split()[1:]
+        return [int(x) for x in fields]
 
 def delta_time():
     x = get_time()
@@ -135,10 +135,13 @@ def delta_time():
 
 def get_cpu():
     t = delta_time()
-    st = sum(t)
-    if st == 0:
-        st = 1
-    result = 100-(t[len(t)-1]*100.00/st)
+    # t: [user, nice, system, idle, iowait, irq, softirq, steal, guest, guest_nice]
+    # 分母含全部 CPU 时间（iowait/steal 也计入），避免共享机器/IO 等待高时上报虚高
+    total = sum(t)
+    if total == 0:
+        return 0.0
+    idle = t[3] + t[4]  # idle + iowait：iowait 是等磁盘，CPU 未实际占用
+    result = 100 - idle * 100.0 / total
     return round(result, 1)
 
 def get_cpu_cores():
