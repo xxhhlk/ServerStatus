@@ -211,6 +211,13 @@ def get_cpu_model():
         return vendor
     return normalize_cpu_model(lscpu.get('architecture') or platform.machine() or platform.processor())
 
+def _is_physical_interface(name):
+    # 只统计内核在 /sys/class/net/<iface>/device 下挂了真实硬件链接的网卡。
+    # 自动排除 lo / ifb* / tailscale* / docker0 / br-* / veth* / bond* / macvlan* / dummy* 等
+    # 虚拟接口，无需维护名字黑名单（且永远补不全，曾漏掉 ifb0、tailscale0 导致流量虚高数倍）。
+    # VLAN 子接口(eth0.100)也没有 device 链接，其流量已在父口体现，排除可避免重复计。
+    return os.path.exists(os.path.join('/sys/class/net', name, 'device'))
+
 def liuliang():
     NET_IN = 0
     NET_OUT = 0
@@ -218,15 +225,13 @@ def liuliang():
         for line in f.readlines():
             netinfo = re.findall(r'([^\s]+):[\s]{0,}(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)', line)
             if netinfo:
-                if netinfo[0][0] == 'lo' or 'tun' in netinfo[0][0] \
-                        or 'docker' in netinfo[0][0] or 'veth' in netinfo[0][0] \
-                        or 'br-' in netinfo[0][0] or 'vmbr' in netinfo[0][0] \
-                        or 'vnet' in netinfo[0][0] or 'kube' in netinfo[0][0] \
-                        or netinfo[0][1]=='0' or netinfo[0][9]=='0':
+                iface = netinfo[0][0]
+                if not _is_physical_interface(iface):
                     continue
-                else:
-                    NET_IN += int(netinfo[0][1])
-                    NET_OUT += int(netinfo[0][9])
+                if netinfo[0][1] == '0' or netinfo[0][9] == '0':
+                    continue
+                NET_IN += int(netinfo[0][1])
+                NET_OUT += int(netinfo[0][9])
     return NET_IN, NET_OUT
 
 def tupd():
@@ -339,13 +344,11 @@ def _net_speed():
             avgrx = 0
             avgtx = 0
             for dev in net_dev[2:]:
-                dev = dev.split(':')
-                if "lo" in dev[0] or "tun" in dev[0] \
-                        or "docker" in dev[0] or "veth" in dev[0] \
-                        or "br-" in dev[0] or "vmbr" in dev[0] \
-                        or "vnet" in dev[0] or "kube" in dev[0]:
+                parts = dev.split(':')
+                iface = parts[0].strip()
+                if not _is_physical_interface(iface):
                     continue
-                dev = dev[1].split()
+                dev = parts[1].split()
                 avgrx += int(dev[0])
                 avgtx += int(dev[8])
             now_clock = time.time()
