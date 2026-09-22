@@ -77,17 +77,17 @@ if [ "$mode" = host ]; then
     --name "$CLIENT_NAME" \
     --network host \
     --pid host \
-    -e SERVER=127.0.0.1 \
-    -e PORT="$AGENT_PORT" \
-    -e USER=s01 \
-    -e PASSWORD=fixture-password \
+    -e serverstatus_SERVER=127.0.0.1 \
+    -e serverstatus_PORT="$AGENT_PORT" \
+    -e serverstatus_USER=s01 \
+    -e serverstatus_PASSWORD=fixture-password \
     -e CLIENT=psutil \
     -e PYTHONUNBUFFERED=1 \
-    -e INTERVAL=1 \
-    -e CU=127.0.0.1 \
-    -e CT=127.0.0.1 \
-    -e CM=127.0.0.1 \
-    -e PROBEPORT="$HTTP_PORT" \
+    -e serverstatus_INTERVAL=1 \
+    -e serverstatus_CU=127.0.0.1 \
+    -e serverstatus_CT=127.0.0.1 \
+    -e serverstatus_CM=127.0.0.1 \
+    -e serverstatus_PROBEPORT="$HTTP_PORT" \
     "$CLIENT_IMAGE" >/dev/null
 else
   echo "Docker Desktop: host networking unavailable; using bridge fallback locally."
@@ -95,17 +95,17 @@ else
     --name "$CLIENT_NAME" \
     --network "$NETWORK" \
     --pid host \
-    -e SERVER="$SERVER_NAME" \
-    -e PORT=35601 \
-    -e USER=s01 \
-    -e PASSWORD=fixture-password \
+    -e serverstatus_SERVER="$SERVER_NAME" \
+    -e serverstatus_PORT=35601 \
+    -e serverstatus_USER=s01 \
+    -e serverstatus_PASSWORD=fixture-password \
     -e CLIENT=psutil \
     -e PYTHONUNBUFFERED=1 \
-    -e INTERVAL=1 \
-    -e CU="$SERVER_NAME" \
-    -e CT="$SERVER_NAME" \
-    -e CM="$SERVER_NAME" \
-    -e PROBEPORT=80 \
+    -e serverstatus_INTERVAL=1 \
+    -e serverstatus_CU="$SERVER_NAME" \
+    -e serverstatus_CT="$SERVER_NAME" \
+    -e serverstatus_CM="$SERVER_NAME" \
+    -e serverstatus_PROBEPORT=80 \
     "$CLIENT_IMAGE" >/dev/null
 fi
 

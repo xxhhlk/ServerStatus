@@ -1,6 +1,8 @@
 const { test, expect } = require('@playwright/test');
 
-const serverSpecs = [
+// 本分支把 #serversToolbar 的显示阈值设为「节点数 > 20」（上游为 > 10），
+// 因此 fixture 必须多于 20 个节点，工具栏才可见，筛选/排序交互才可执行。
+const baseServerSpecs = [
   { name: 'alpha-online', location: 'SG-Singapore', os: 'ubuntu', online4: true },
   { name: 'bravo-online', location: 'JP-Tokyo', os: 'debian', online4: true },
   { name: 'charlie-online', location: 'US-LosAngeles', os: 'windows', online4: true },
@@ -14,6 +16,18 @@ const serverSpecs = [
   { name: 'kilo-online', location: 'SG-Singapore', os: 'ubuntu', online4: true, online6: true },
   { name: 'zulu-online', location: 'JP-Osaka', os: 'debian', online4: true }
 ];
+
+// 填充节点：在线、非 Windows、指标正常，因此不影响
+// 「离线=1 / 异常=2 / Windows=2 / KR-Seoul=1」这些筛选断言的语义。
+const fillerServerSpecs = Array.from({ length: 12 }, (_unused, index) => ({
+  name: `filler-${String(index + 1).padStart(2, '0')}`,
+  location: 'SG-Singapore',
+  os: 'ubuntu',
+  online4: true
+}));
+
+const serverSpecs = [...baseServerSpecs, ...fillerServerSpecs];
+const TOTAL_SERVERS = serverSpecs.length;
 
 function serverFixture(spec, index) {
   const received = 2_000_000_000 + index * 100_000_000;
@@ -75,9 +89,9 @@ test.beforeEach(async ({ page }) => {
   }));
   await page.goto('/');
   if (page.viewportSize().width <= 700) {
-    await expect(page.locator('#serversCards .card')).toHaveCount(12);
+    await expect(page.locator('#serversCards .card')).toHaveCount(TOTAL_SERVERS);
   } else {
-    await expect(page.locator('#serversBody .row-server')).toHaveCount(12);
+    await expect(page.locator('#serversBody .row-server')).toHaveCount(TOTAL_SERVERS);
   }
 });
 
@@ -178,7 +192,7 @@ test.describe('mobile layout', () => {
   test('uses cards, hides overview and keeps the detail drawer inside the viewport', async ({ page }) => {
     await expect(page.locator('#overviewCards')).toBeHidden();
     await expect(page.locator('#serversCards')).toBeVisible();
-    await expect(page.locator('#serversCards .card')).toHaveCount(12);
+    await expect(page.locator('#serversCards .card')).toHaveCount(TOTAL_SERVERS);
     expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(391);
 
     await page.locator('#serversCards .card', { hasText: 'alpha-online' }).click();
