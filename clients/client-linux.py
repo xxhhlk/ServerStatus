@@ -246,16 +246,6 @@ def get_os_name():
     except Exception:
         return 'unknown'
 
-def is_ignored_network_interface(name):
-    name = str(name or '').strip().lower()
-    is_loopback = (
-        name == 'lo'
-        or (name.startswith('lo') and name[2:].isdigit())
-        or name.startswith('loopback')
-    )
-    virtual_prefixes = ('tun', 'docker', 'veth', 'br-', 'vmbr', 'vnet', 'kube')
-    return not name or is_loopback or name.startswith(virtual_prefixes)
-
 def liuliang():
     NET_IN = 0
     NET_OUT = 0
