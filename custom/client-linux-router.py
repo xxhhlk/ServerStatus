@@ -23,9 +23,12 @@ CU = "gd-guangzhou-cu-v4.ip.zstaticcdn.com"
 CT = "gd-shenzhen-ct-v4.ip.zstaticcdn.com"
 CM = "gd-guangzhou-cm-v4.ip.zstaticcdn.com"
 PROBEPORT = 443
-PROBE_PROTOCOL_PREFER = "ipv6"  # ipv4, ipv6
+PROBE_PROTOCOL_PREFER = "ipv4"  # ipv4, ipv6；CU/CT/CM 为 -v4 域名且无 AAAA，必须用 ipv4，否则解析必失败、DNS 节流失效
 PING_PACKET_HISTORY_LEN = 200
 INTERVAL = 1
+# 与 clients/ 统一：探针域名 TTL 约 180s，30s 已能拿到绝大部分削减收益
+DNS_REFRESH_INTERVAL = 30  # 重解析探针域名的间隔（秒），不影响 1s 建连探测频率
+NET_PROBE_INTERVAL = 30    # online4/online6 探测间隔（秒）
 
 import socket
 import time
@@ -64,6 +67,8 @@ INTERVAL = _env_int("INTERVAL", INTERVAL)
 PROBEPORT = _env_int("PROBEPORT", PROBEPORT)
 PROBE_PROTOCOL_PREFER = _env_str("PROBE_PROTOCOL_PREFER", PROBE_PROTOCOL_PREFER)
 PING_PACKET_HISTORY_LEN = _env_int("PING_PACKET_HISTORY_LEN", PING_PACKET_HISTORY_LEN)
+DNS_REFRESH_INTERVAL = _env_int("DNS_REFRESH_INTERVAL", DNS_REFRESH_INTERVAL)
+NET_PROBE_INTERVAL = _env_int("NET_PROBE_INTERVAL", NET_PROBE_INTERVAL)
 CU = _env_str("CU", CU)
 CT = _env_str("CT", CT)
 CM = _env_str("CM", CM)
@@ -468,7 +473,8 @@ _online_status = {4: False, 6: False}
 _online_target = 4
 
 def _net_probe_thread():
-    """独立线程：每 10s 探测一次 online4/online6，避免 DNS 卡死阻塞主循环上报。
+    """独立线程：每 NET_PROBE_INTERVAL 秒探测一次 online4/online6（get_network），
+    避免 DNS 卡死阻塞主循环上报。默认 30s 对 600s 的 offline warning 看门狗足够。
     主循环只读 _online_status 快照；_online_target 由主循环在连接后设置。"""
     global _online_status
     while True:
@@ -477,7 +483,7 @@ def _net_probe_thread():
             _online_status[target] = get_network(target)
         except Exception:
             _online_status[target] = False
-        time.sleep(10)
+        time.sleep(NET_PROBE_INTERVAL)
 
 lostRate = {
     '10010': 0.0,
@@ -503,30 +509,35 @@ diskIO = {
 }
 monitorServer = {}
 
+def _should_resolve(host, last_resolve, now, interval):
+    """是否需要重新解析探针域名。抽成纯函数便于单测（_ping_thread 是无限循环）。
+    host 为纯 IPv6 字面量时无需解析；last_resolve 为 None 表示立即解析（首次或建连失败后）。"""
+    if host.count(':') >= 1:  # 纯 IPv6 字面量，无需解析
+        return False
+    return last_resolve is None or now - last_resolve >= interval
+
 def _ping_thread(host, mark, port):
     lostPacket = 0
     packet_queue = Queue(maxsize=PING_PACKET_HISTORY_LEN)
 
-    # 路由器定制：resolve DNS every 150 iterations to reduce DNS queries，失败回退缓存 IP
-    resolve_count = -1          # init to -1, ensure first iteration resolves DNS
+    # 路由器定制：DNS 解析按 DNS_REFRESH_INTERVAL 节流（原为每 150 轮计数器节流，
+    # 计数在超时轮会漂移，故改用时间节流）。失败沿用上次成功 IP。
     IP = host
-    cached_ip = None            # cache last successful resolved IP for retry
+    cached_ip = None
+    last_resolve = None
+
     while True:
-        if host.count(':') < 1:  # if not plain ipv6 address, means ipv4 address or hostname
+        now = time.monotonic()
+        if _should_resolve(host, last_resolve, now, DNS_REFRESH_INTERVAL):
+            last_resolve = now
             try:
-                if resolve_count % 150 == 0:
-                    if PROBE_PROTOCOL_PREFER == 'ipv4':
-                        IP = socket.getaddrinfo(host, None, socket.AF_INET)[0][4][0]
-                    else:
-                        IP = socket.getaddrinfo(host, None, socket.AF_INET6)[0][4][0]
-                    cached_ip = IP     # save successful resolved IP
+                if PROBE_PROTOCOL_PREFER == 'ipv4':
+                    cached_ip = socket.getaddrinfo(host, None, socket.AF_INET)[0][4][0]
+                else:
+                    cached_ip = socket.getaddrinfo(host, None, socket.AF_INET6)[0][4][0]
             except Exception:
-                if cached_ip:          # use cached IP if DNS fails
-                    IP = cached_ip
-                # if no cache, keep IP unchanged (socket.create_connection will handle hostname)
-            resolve_count = (resolve_count + 1) % 150
-            if resolve_count < 0:      # handle initial -1 value
-                resolve_count = 0
+                cached_ip = cached_ip or host  # 沿用上次成功值；首次失败交给 create_connection 兜底
+            IP = cached_ip
 
         if packet_queue.full():
             if packet_queue.get() == 0:
@@ -544,6 +555,7 @@ def _ping_thread(host, mark, port):
             else:
                 lostPacket += 1
                 packet_queue.put(0)
+                last_resolve = None  # 建连失败→下轮强制重解析，避免钉死已失效 IP
 
         if packet_queue.qsize() > 30:
             lostRate[mark] = float(lostPacket) / packet_queue.qsize()

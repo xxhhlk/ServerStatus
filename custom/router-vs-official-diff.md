@@ -16,14 +16,16 @@
 | PORT | 37014 | 35601 |
 | CU/CT/CM | zstaticcdn.com 三网探针 | cloudcpp.com 三网探针 |
 | PROBEPORT | 443 | 80 |
-| PROBE_PROTOCOL_PREFER | ipv6 | ipv4 |
+| PROBE_PROTOCOL_PREFER | ipv4 | ipv4 |
 | PING_PACKET_HISTORY_LEN | 200 | 100 |
+| DNS_REFRESH_INTERVAL | 30 | 30（两版已统一） |
+| NET_PROBE_INTERVAL | 30 | 30（两版已统一） |
 | ONLINE_PACKET_HISTORY_LEN | 200 | 已删除（无此概念） |
 | socket 默认超时 | 15s | 30s |
 
 ## 二、新增机制（官方版有，router 版无）
 
-1. **Docker env 覆盖**：`_env_str()` / `_env_int()`，支持 SERVER/USER/PASSWORD/PORT/INTERVAL/PROBEPORT/PROBE_PROTOCOL_PREFER/PING_PACKET_HISTORY_LEN/CU/CT/CM 环境变量注入。优先级：CLI 参数 > 用户改的常量 > env。
+1. **Docker env 覆盖**：`_env_str()` / `_env_int()`，支持 SERVER/USER/PASSWORD/PORT/INTERVAL/PROBEPORT/PROBE_PROTOCOL_PREFER/PING_PACKET_HISTORY_LEN/DNS_REFRESH_INTERVAL/NET_PROBE_INTERVAL/CU/CT/CM 环境变量注入。优先级：CLI 参数 > 用户改的常量 > env。
 2. **`parse_cli_args()`**：用 `partition('=')` + 5 键白名单解析。router 版是遍历整个 `sys.argv`、只要含子串 `'SERVER'` 就 split —— 误匹配风险高（任何含该子串的参数都会命中），官方版更严谨。
 3. **`get_cpu_cores()`**：读 `/proc/stat` 数 `cpu\d+` 行，失败回退 `os.cpu_count()`。
 4. **`get_cpu_model()`**：降级链 `/proc/cpuinfo model name → lscpu model name → hardware → processor → platform.processor() → vendor_id → architecture`，过滤泛型型号（x86_64/armv* 等），截断 160 字符。
@@ -52,9 +54,14 @@
 ### _ping_thread()（丢包/延迟探测）
 | 项 | router 版 | 官方版 |
 |---|---|---|
-| DNS 解析 | 每 150 轮解析一次（省 DNS 查询），失败用 cached_ip 回退 | 每轮都解析（flush dns every time），失败保持原值 |
+| DNS 解析 | 按 DNS_REFRESH_INTERVAL(30s) 时间节流，失败用 cached_ip 回退 | 同左（两版已统一为 30s 时间节流） |
 | 建连超时 | 2s | 1s |
 | 历史队列长度 | 200 | 100 |
+
+> **`PROBE_PROTOCOL_PREFER` 必须为 `ipv4`**：CU/CT/CM 是 `*-v4.ip.zstaticcdn.com`，实测无 AAAA 记录，
+> 若设为 `ipv6` 则 `getaddrinfo(AF_INET6)` 必然抛 `gaierror`，`IP` 始终等于域名，
+> `create_connection` 每轮自行解析一次 —— DNS 节流（无论时间节流还是旧的计数器节流）全部失效。
+> 实测对照：`ipv4` → 20/20 轮用真实 IP；`ipv6` → 20/20 轮退回域名解析。
 
 ### _net_speed()
 - router 版：只统计 **eth0**（路由器上通常只有 WAN 走 eth0）。
@@ -92,7 +99,7 @@ router 版（旧协议）：
 1. **流量归零保护**（光猫/路由器重启后流量计数器不归零，历史累计保留）—— 官方版无此机制，服务器场景不需要。
 2. **只统计 wan0/eth0** —— 路由器多网卡场景必须，否则会把 LAN 内网流量计入。
 3. Python 2 兼容 Queue 导入。
-4. 探针域名/探测口针对大陆网络优化（zstaticcdn、443、ipv6 优先）。
+4. 探针域名/探测口针对大陆网络优化（zstaticcdn、443）。
 
 ## 五、官方版独有（router 无）
 
