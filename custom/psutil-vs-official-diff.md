@@ -97,7 +97,12 @@ def is_virtual_nic(name):
 | `liuliang()` | 每轮调 psutil 累加（黑名单过滤） | 只读全局快照（过滤已在 _net_monitor 完成） |
 | `is_virtual_nic()` / `_win_is_physical()` / `_win_build_map()` | ❌ | ✅ 新增（PNPDeviceID 虚拟网卡识别） |
 | `get_realtime_data()` t4 | `target=_net_speed` | `target=_net_monitor` |
+| `_should_resolve()` | ✅ 新增（DNS 解析节流判定） | ✅ 新增（同源） |
 | 其余全部（get_uptime/memory/swap/hdd/cpu/cpu_model/tupd/_ping_thread/_disk_io/_monitor_thread/byte_str/main/上报字段） | — | **逐行一致** |
+
+> `_ping_thread` 的 DNS 解析自本次起按 `DNS_REFRESH_INTERVAL`（默认 30s，探针域名 TTL 约 180s）节流，
+> 建连探测频率仍由 `INTERVAL`（1s）决定，故丢包窗口 `PING_PACKET_HISTORY_LEN × INTERVAL` 不变。
+> 该改动同时落在官方版与本自定义版，两版 `_ping_thread` 仍逐行一致。
 
 ## 四、结论
 

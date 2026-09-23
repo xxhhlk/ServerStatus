@@ -19,6 +19,10 @@ PROBEPORT = 80
 PROBE_PROTOCOL_PREFER = "ipv4"  # ipv4, ipv6
 PING_PACKET_HISTORY_LEN = 100
 INTERVAL = 1
+# 三网探针域名 TTL 约 180s，30s 已能拿到绝大部分削减收益；
+# 勿低于 10s，否则相对 TTL 仍是重复解析。
+DNS_REFRESH_INTERVAL = 30  # 重解析探针域名的间隔（秒），不影响 1s 建连探测频率
+NET_PROBE_INTERVAL = 30    # online4/online6 探测间隔（秒）
 
 import socket
 import time
@@ -61,6 +65,8 @@ INTERVAL = _env_int("serverstatus_INTERVAL", INTERVAL)
 PROBEPORT = _env_int("serverstatus_PROBEPORT", PROBEPORT)
 PROBE_PROTOCOL_PREFER = _env_str("serverstatus_PROBE_PROTOCOL_PREFER", PROBE_PROTOCOL_PREFER)
 PING_PACKET_HISTORY_LEN = _env_int("serverstatus_PING_PACKET_HISTORY_LEN", PING_PACKET_HISTORY_LEN)
+DNS_REFRESH_INTERVAL = _env_int("serverstatus_DNS_REFRESH_INTERVAL", DNS_REFRESH_INTERVAL)
+NET_PROBE_INTERVAL = _env_int("serverstatus_NET_PROBE_INTERVAL", NET_PROBE_INTERVAL)
 CU = _env_str("serverstatus_CU", CU)
 CT = _env_str("serverstatus_CT", CT)
 CM = _env_str("serverstatus_CM", CM)
@@ -295,7 +301,8 @@ _online_status = {4: False, 6: False}
 _online_target = 4
 
 def _net_probe_thread():
-    """独立线程：每 10s 探测一次 online4/online6（get_network），避免 DNS 卡死阻塞主循环上报。
+    """独立线程：每 NET_PROBE_INTERVAL 秒探测一次 online4/online6（get_network），
+    避免 DNS 卡死阻塞主循环上报。默认 30s 对 600s 的 offline warning 看门狗足够。
     主循环只读 _online_status 快照；_online_target 由主循环在连接后设置。"""
     global _online_status
     while True:
@@ -304,7 +311,7 @@ def _net_probe_thread():
             _online_status[target] = get_network(target)
         except Exception:
             _online_status[target] = False
-        time.sleep(10)
+        time.sleep(NET_PROBE_INTERVAL)
 
 def get_os_name():
     try:
@@ -590,21 +597,36 @@ def update_net_speed(avgrx, avgtx, now_clock=None):
     netSpeed["avgtx"] = avgtx
     return netSpeed["netrx"], netSpeed["nettx"]
 
+def _should_resolve(host, last_resolve, now, interval):
+    """是否需要重新解析探针域名。抽成纯函数便于单测（_ping_thread 是无限循环）。
+    host 为纯 IPv6 字面量时无需解析；last_resolve 为 None 表示立即解析（首次或建连失败后）。"""
+    if host.count(':') >= 1:  # 纯 IPv6 字面量，无需解析
+        return False
+    return last_resolve is None or now - last_resolve >= interval
+
 def _ping_thread(host, mark, port):
     lostPacket = 0
     packet_queue = Queue(maxsize=PING_PACKET_HISTORY_LEN)
 
+    # DNS 解析按 DNS_REFRESH_INTERVAL 节流（探针域名 TTL 约 180s）。
+    # IP 必须提到循环外：否则跳过的轮次 IP=域名，create_connection 仍会解析一次，节流失效。
+    # 建连频率仍由 INTERVAL 决定，丢包窗口 PING_PACKET_HISTORY_LEN*INTERVAL 不变。
+    IP = host
+    cached_ip = None
+    last_resolve = None
+
     while True:
-        # flush dns, every time.
-        IP = host
-        if host.count(':') < 1:  # if not plain ipv6 address, means ipv4 address or hostname
+        now = time.monotonic()  # 与 update_net_speed 一致，不受系统时钟回拨影响
+        if _should_resolve(host, last_resolve, now, DNS_REFRESH_INTERVAL):
+            last_resolve = now
             try:
                 if PROBE_PROTOCOL_PREFER == 'ipv4':
-                    IP = socket.getaddrinfo(host, None, socket.AF_INET)[0][4][0]
+                    cached_ip = socket.getaddrinfo(host, None, socket.AF_INET)[0][4][0]
                 else:
-                    IP = socket.getaddrinfo(host, None, socket.AF_INET6)[0][4][0]
+                    cached_ip = socket.getaddrinfo(host, None, socket.AF_INET6)[0][4][0]
             except Exception:
-                pass
+                cached_ip = cached_ip or host  # 沿用上次成功值；首次失败交给 create_connection 兜底
+            IP = cached_ip
 
         if packet_queue.full():
             if packet_queue.get() == 0:
@@ -622,6 +644,7 @@ def _ping_thread(host, mark, port):
             else:
                 lostPacket += 1
                 packet_queue.put(0)
+                last_resolve = None  # 建连失败→下轮强制重解析，避免钉死已失效 IP
 
         if packet_queue.qsize() > 30:
             lostRate[mark] = float(lostPacket) / packet_queue.qsize()

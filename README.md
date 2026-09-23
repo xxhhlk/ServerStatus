@@ -81,10 +81,12 @@ nohup python3 client-linux.py SERVER=127.0.0.1 USER=s01 PASSWORD=USER_DEFAULT_PA
 | `USER` | `s01` | 客户端用户名，必须匹配服务端配置 |
 | `PORT` | `35601` | Agent TCP 上报端口 |
 | `PASSWORD` | `USER_DEFAULT_PASSWORD` | 客户端密码，必须匹配服务端配置 |
-| `INTERVAL` | `1` | 状态上报间隔，单位秒 |
+| `INTERVAL` | `1` | 状态上报间隔，单位秒；同时是三网建连探测的循环周期 |
 | `PROBEPORT` | `80` | 三网 TCP 探测端口 |
 | `PROBE_PROTOCOL_PREFER` | `ipv4` | 探测协议偏好，可选 `ipv4`、`ipv6` |
-| `PING_PACKET_HISTORY_LEN` | `100` | 丢包历史窗口 |
+| `PING_PACKET_HISTORY_LEN` | `100` | 丢包历史窗口；丢包率统计窗口 = 该值 × `INTERVAL` |
+| `DNS_REFRESH_INTERVAL` | `30` | 三网探针域名重解析间隔，单位秒；只节流 DNS 查询，不改变建连探测频率 |
+| `NET_PROBE_INTERVAL` | `30` | `online4`/`online6` 探测间隔，单位秒 |
 | `CU` | `cu.tz.cloudcpp.com` | 联通探测地址 |
 | `CT` | `ct.tz.cloudcpp.com` | 电信探测地址 |
 | `CM` | `cm.tz.cloudcpp.com` | 移动探测地址 |

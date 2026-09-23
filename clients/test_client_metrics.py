@@ -233,5 +233,86 @@ veth123: 8000 8 0 0 0 0 0 0 8000 8 0 0 0 0 0 0
             self.assertEqual(client["get_cpu_model"](), "12th Gen Intel(R) Core(TM) i9-12900H")
 
 
+    # --- DNS 解析节流 / 在线探测间隔 --------------------------------------
+
+    def test_should_resolve_throttles_by_interval(self):
+        """_ping_thread 的解析节流：纯函数便于验证，1s 循环 30s 间隔应只解析 3~4 次。"""
+        for filename in ("client-linux.py", "client-psutil.py"):
+            with self.subTest(client=filename):
+                client = load_client(filename)
+                should = client["_should_resolve"]
+                # last_resolve 为 None → 立即解析（首次、或建连失败后强制重试）
+                self.assertTrue(should("cu.tz.cloudcpp.com", None, 0.0, 30))
+                # 间隔内不重复解析
+                self.assertFalse(should("cu.tz.cloudcpp.com", 0.0, 1.0, 30))
+                self.assertFalse(should("cu.tz.cloudcpp.com", 0.0, 29.9, 30))
+                # 到达间隔 → 解析
+                self.assertTrue(should("cu.tz.cloudcpp.com", 0.0, 30.0, 30))
+                # 纯 IPv6 字面量永不解析
+                self.assertFalse(should("2409:8057:5c00:30::6", None, 0.0, 30))
+                # 模拟 1s 循环推进 100 轮（带状态）：interval=30 → 恰在 0/30/60/90 解析
+                last_resolve = None
+                resolves = 0
+                for step in range(100):
+                    now = float(step)
+                    if should("cu.tz.cloudcpp.com", last_resolve, now, 30):
+                        resolves += 1
+                        last_resolve = now
+                self.assertEqual(resolves, 4)
+
+    def test_dns_throttle_preserves_connect_probe_frequency(self):
+        """回归护栏：DNS_REFRESH_INTERVAL 只节流解析，不得被误接到 INTERVAL 上。
+        丢包窗口 = PING_PACKET_HISTORY_LEN × INTERVAL，循环周期必须保持 1s。"""
+        for filename in ("client-linux.py", "client-psutil.py"):
+            with self.subTest(client=filename):
+                client = load_client(filename)
+                self.assertEqual(client["INTERVAL"], 1)
+                self.assertEqual(client["PING_PACKET_HISTORY_LEN"], 100)
+                self.assertEqual(client["DNS_REFRESH_INTERVAL"], 30)
+                self.assertEqual(client["NET_PROBE_INTERVAL"], 30)
+                source = (CLIENT_DIR / filename).read_text(encoding="utf-8")
+                # 解析必须走节流判定，且 IP 在循环外初始化（否则跳过的轮次会退回域名解析）
+                self.assertIn("_should_resolve(host, last_resolve, now, DNS_REFRESH_INTERVAL)", source)
+                self.assertNotIn("flush dns", source)
+                # _net_probe_thread 不再硬编码 10s
+                self.assertNotIn("time.sleep(10)\n\nlostRate", source)
+
+    def test_ping_thread_resolves_once_then_reuses_ip(self):
+        """端到端：_ping_thread 在多轮内只解析一次，且复用同一 IP 建连。"""
+        for filename in ("client-linux.py", "client-psutil.py"):
+            with self.subTest(client=filename):
+                client = load_client(filename)
+                resolve_calls = []
+                connect_targets = []
+                stop_after = 5
+                client_globals = client["_ping_thread"].__globals__
+                real_socket = client_globals["socket"]
+
+                def fake_getaddrinfo(host, port, family):
+                    resolve_calls.append(host)
+                    return [(family, None, None, None, ("10.0.0.9", 0))]
+
+                def fake_create_connection(target, timeout=None):
+                    connect_targets.append(target)
+                    if len(connect_targets) >= stop_after:
+                        raise SystemExit  # 退出无限循环
+                    return mock.MagicMock()
+
+                # 只替换这两个函数，保留真实 socket.error（异常类不能被 mock）
+                try:
+                    with mock.patch.object(real_socket, "getaddrinfo", fake_getaddrinfo), \
+                            mock.patch.object(real_socket, "create_connection", fake_create_connection), \
+                            mock.patch.dict(client_globals, {"INTERVAL": 0.001,
+                                                             "DNS_REFRESH_INTERVAL": 30}):
+                        client["_ping_thread"]("cu.tz.cloudcpp.com", "10010", 80)
+                except SystemExit:
+                    pass
+
+                # 5 轮建连，但 DNS 只解析 1 次（首轮），且每轮都用解析出的 IP
+                self.assertEqual(len(connect_targets), stop_after)
+                self.assertEqual(resolve_calls, ["cu.tz.cloudcpp.com"])
+                self.assertEqual(connect_targets, [("10.0.0.9", 80)] * stop_after)
+
+
 if __name__ == "__main__":
     unittest.main()
