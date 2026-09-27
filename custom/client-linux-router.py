@@ -29,6 +29,7 @@ INTERVAL = 1
 # 与 clients/ 统一：探针域名 TTL 约 180s，30s 已能拿到绝大部分削减收益
 DNS_REFRESH_INTERVAL = 30  # 重解析探针域名的间隔（秒），不影响 1s 建连探测频率
 NET_PROBE_INTERVAL = 30    # online4/online6 探测间隔（秒）
+NET_COUNTER_WRITE_INTERVAL = 10  # 累计流量写盘间隔（轮），降低 USB 闪存写入
 SOCKSTAT_REFRESH_INTERVAL = 60  # TCP 计数走 sockstat 时，LISTEN 缓存的刷新间隔（秒）
 
 import socket
@@ -70,6 +71,7 @@ PROBE_PROTOCOL_PREFER = _env_str("PROBE_PROTOCOL_PREFER", PROBE_PROTOCOL_PREFER)
 PING_PACKET_HISTORY_LEN = _env_int("PING_PACKET_HISTORY_LEN", PING_PACKET_HISTORY_LEN)
 DNS_REFRESH_INTERVAL = _env_int("DNS_REFRESH_INTERVAL", DNS_REFRESH_INTERVAL)
 NET_PROBE_INTERVAL = _env_int("NET_PROBE_INTERVAL", NET_PROBE_INTERVAL)
+NET_COUNTER_WRITE_INTERVAL = _env_int("NET_COUNTER_WRITE_INTERVAL", NET_COUNTER_WRITE_INTERVAL)
 SOCKSTAT_REFRESH_INTERVAL = _env_int("SOCKSTAT_REFRESH_INTERVAL", SOCKSTAT_REFRESH_INTERVAL)
 CU = _env_str("CU", CU)
 CT = _env_str("CT", CT)
@@ -89,19 +91,57 @@ def get_uptime():
         return int(uptime[0])
 
 def get_memory():
-    re_parser = re.compile(r'^(?P<key>\S*):\s*(?P<value>\d*)\s*kB')
     result = dict()
-    for line in open('/proc/meminfo'):
-        match = re_parser.match(line)
-        if not match:
-            continue
-        key, value = match.groups(['key', 'value'])
-        result[key] = int(value)
+    with open('/proc/meminfo') as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) < 2 or not parts[0].endswith(':'):
+                continue
+            try:
+                result[parts[0][:-1]] = int(parts[1])
+            except ValueError:
+                pass
     MemTotal = float(result['MemTotal'])
     MemUsed = MemTotal-float(result['MemFree'])-float(result['Buffers'])-float(result['Cached'])-float(result['SReclaimable'])
     SwapTotal = float(result['SwapTotal'])
     SwapFree = float(result['SwapFree'])
     return int(MemTotal), int(MemUsed), int(SwapTotal), int(SwapFree)
+
+_os_name = None
+
+def get_os_name():
+    # 结果是常量（platform.system() 与 /etc/os-release 都不变），进程内只取一次。
+    # 本机没有 /etc/os-release，旧实现每轮都白跑一次必然失败的 open。
+    global _os_name
+    if _os_name is not None:
+        return _os_name
+    try:
+        sysname = platform.system().lower()
+        if sysname.startswith('linux'):
+            _os_name = 'linux'
+            try:
+                with open('/etc/os-release') as f:
+                    for line in f:
+                        if line.startswith('ID='):
+                            val = line.strip().split('=', 1)[1].strip().strip('"')
+                            if val:
+                                _os_name = val
+                            break
+            except Exception:
+                pass
+        elif sysname.startswith('darwin'):
+            _os_name = 'darwin'
+        elif sysname.startswith('freebsd'):
+            _os_name = 'freebsd'
+        elif sysname.startswith('openbsd'):
+            _os_name = 'openbsd'
+        elif sysname.startswith('netbsd'):
+            _os_name = 'netbsd'
+        else:
+            _os_name = sysname or 'unknown'
+    except Exception:
+        return 'unknown'
+    return _os_name
 
 def get_hdd():
     valid_fs = {
@@ -401,19 +441,23 @@ def get_cpu_model_display():
         return '%s (%s)' % (pid, fallback)
     return fallback
 
+_net_counter_tick = 0
+
 def liuliang():
+    global _net_counter_tick
     # 路由器定制：只统计 wan0 接口（路由器 WAN 口，避免把内网/LAN 流量算进去）
     NET_IN = 0
     NET_OUT = 0
     with open('/proc/net/dev') as f:
-        for line in f.readlines():
-            netinfo = re.findall(r'([^\s]+):[\s]{0,}(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)', line)
-            if netinfo:
-                if 'wan0' not in netinfo[0][0]:
-                    continue
-                else:
-                    NET_IN += int(netinfo[0][1])
-                    NET_OUT += int(netinfo[0][9])
+        next(f, None)   # 跳过两行表头
+        next(f, None)
+        for line in f:
+            parts = line.split(':')
+            if len(parts) < 2 or 'wan0' not in parts[0]:
+                continue
+            cols = parts[1].split()
+            NET_IN += int(cols[0])
+            NET_OUT += int(cols[8])
     # 路由器定制：持久化计数器，处理光猫/路由器重启归零
     # 状态: total_in total_out last_raw_in last_raw_out uptime
     # 正常轮: total += 增量; 归零轮(光猫重启): 封口上一段再重新累计
@@ -440,8 +484,13 @@ def liuliang():
                 total_out += NET_OUT - last_raw_out
     except:
         pass
-    with open(state_file, 'w') as f:
-        f.write(f'{total_in} {total_out} {NET_IN} {NET_OUT} {uptime}')
+    # 写盘节流：每秒写一次 USB 是 86400 次/天。累计量不会丢——last_raw 与 total 同批落盘，
+    # 重启后 total += NET_IN - last_raw 会把两次写盘之间的增量补回来；只有恰好跨光猫重启才可能少算一段。
+    _net_counter_tick += 1
+    if _net_counter_tick >= NET_COUNTER_WRITE_INTERVAL:
+        _net_counter_tick = 0
+        with open(state_file, 'w') as f:
+            f.write(f'{total_in} {total_out} {NET_IN} {NET_OUT} {uptime}')
     return total_in, total_out
 
 # /proc/net/tcp 状态码(hex)见内核 tcp_states.h。对齐原 ss 语义：
@@ -955,34 +1004,7 @@ if __name__ == '__main__':
                 array['tcp'], array['udp'], array['process'], array['thread'] = tupd()
                 array['io_read'] = diskIO.get("read")
                 array['io_write'] = diskIO.get("write")
-                # report OS (normalized)
-                try:
-                    sysname = platform.system().lower()
-                    if sysname.startswith('linux'):
-                        os_name = 'linux'
-                        # try distro from os-release
-                        try:
-                            with open('/etc/os-release') as f:
-                                for line in f:
-                                    if line.startswith('ID='):
-                                        val = line.strip().split('=',1)[1].strip().strip('"')
-                                        if val: os_name = val
-                                        break
-                        except Exception:
-                            pass
-                    elif sysname.startswith('darwin'):
-                        os_name = 'darwin'
-                    elif sysname.startswith('freebsd'):
-                        os_name = 'freebsd'
-                    elif sysname.startswith('openbsd'):
-                        os_name = 'openbsd'
-                    elif sysname.startswith('netbsd'):
-                        os_name = 'netbsd'
-                    else:
-                        os_name = sysname or 'unknown'
-                except Exception:
-                    os_name = 'unknown'
-                array['os'] = os_name
+                array['os'] = get_os_name()
                 items = []
                 for _n, st in monitorServer.items():
                     key = str(_n)
