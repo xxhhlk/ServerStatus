@@ -29,6 +29,7 @@ INTERVAL = 1
 # 与 clients/ 统一：探针域名 TTL 约 180s，30s 已能拿到绝大部分削减收益
 DNS_REFRESH_INTERVAL = 30  # 重解析探针域名的间隔（秒），不影响 1s 建连探测频率
 NET_PROBE_INTERVAL = 30    # online4/online6 探测间隔（秒）
+SOCKSTAT_REFRESH_INTERVAL = 60  # TCP 计数走 sockstat 时，LISTEN 缓存的刷新间隔（秒）
 
 import socket
 import time
@@ -69,6 +70,7 @@ PROBE_PROTOCOL_PREFER = _env_str("PROBE_PROTOCOL_PREFER", PROBE_PROTOCOL_PREFER)
 PING_PACKET_HISTORY_LEN = _env_int("PING_PACKET_HISTORY_LEN", PING_PACKET_HISTORY_LEN)
 DNS_REFRESH_INTERVAL = _env_int("DNS_REFRESH_INTERVAL", DNS_REFRESH_INTERVAL)
 NET_PROBE_INTERVAL = _env_int("NET_PROBE_INTERVAL", NET_PROBE_INTERVAL)
+SOCKSTAT_REFRESH_INTERVAL = _env_int("SOCKSTAT_REFRESH_INTERVAL", SOCKSTAT_REFRESH_INTERVAL)
 CU = _env_str("CU", CU)
 CT = _env_str("CT", CT)
 CM = _env_str("CM", CM)
@@ -461,6 +463,71 @@ def _count_sockets(paths, keep=(), exclude=()):
             pass
     return n
 
+# TCP 计数默认走 /proc/net/sockstat：`TCP.inuse` 是**非 TIME_WAIT** 的 TCP socket 数
+# （TIME_WAIT 单列 `tw`），故 inuse(tcp)+inuse(tcp6)-LISTEN数 恰好等于上面的全表口径。
+# 路由器上 TCP 表可达 6500 行、其中 82% 是 TIME_WAIT，全表读一次约 55~68ms CPU，
+# 而 sockstat 两个小文件仅 0.19ms。LISTEN 数只能从全表拿，故周期刷新 + 每次刷新对账。
+_tcp_listen = None        # 缓存的 LISTEN(0A) 计数；None = 未启用（对账未过或已停用）
+_tcp_listen_clock = 0.0   # 上次刷新时刻
+
+def _sockstat_tcp_inuse():
+    # /proc/net/sockstat[6] 每行形如 "TCP: inuse 1145 orphan 5 tw 5032 alloc ..."
+    total = 0
+    for path, key in (('/proc/net/sockstat', 'TCP:'),
+                      ('/proc/net/sockstat6', 'TCP6:')):
+        try:
+            with open(path) as f:
+                for line in f:
+                    parts = line.split()
+                    if parts and parts[0] == key:
+                        total += int(parts[parts.index('inuse') + 1])
+                        break
+        except (IOError, ValueError, IndexError):
+            return None
+    return total
+
+def _table_tcp_stats():
+    # 全表扫一遍，一次拿到「非 06/0A 计数」与「LISTEN(0A) 计数」
+    target = 0
+    listen = 0
+    for path in ('/proc/net/tcp', '/proc/net/tcp6'):
+        try:
+            with open(path) as f:
+                next(f, None)  # 跳过表头
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 4:
+                        continue
+                    if parts[3] == '0A':
+                        listen += 1
+                    elif parts[3] != '06':
+                        target += 1
+        except IOError:
+            pass
+    return target, listen
+
+def _count_tcp():
+    global _tcp_listen, _tcp_listen_clock
+    now = time.monotonic()
+    if _tcp_listen is not None and now - _tcp_listen_clock < SOCKSTAT_REFRESH_INTERVAL:
+        inuse = _sockstat_tcp_inuse()
+        if inuse is not None:
+            return inuse - _tcp_listen
+    # 走到这里：全表兜底 / 首次取 LISTEN / 周期刷新。顺带对账：
+    # 全表读要 55~68ms，期间连接 churn 会让 inuse 漂移几个百分点，故用前后两次读数夹逼 + 容差。
+    # 对账不过就停用缓存——下次仍走全表并重新对账，通过即自动恢复，不会误永久退回。
+    before = _sockstat_tcp_inuse()
+    target, listen = _table_tcp_stats()
+    after = _sockstat_tcp_inuse()
+    if before is not None and after is not None:
+        tol = max(20, int(target * 0.05))
+        if min(before, after) - listen - tol <= target <= max(before, after) - listen + tol:
+            _tcp_listen = listen
+            _tcp_listen_clock = now
+        else:
+            _tcp_listen = None
+    return target
+
 def _count_processes():
     try:
         return sum(1 for d in os.listdir('/proc') if d.isdigit())
@@ -481,9 +548,8 @@ def tupd():
     tcp, udp, process, thread count: for view ddcc attack , then send warning
     :return:
     '''
-    t = _count_sockets(('/proc/net/tcp', '/proc/net/tcp6'), exclude=('06', '0A'))
     u = _count_sockets(('/proc/net/udp', '/proc/net/udp6'), keep=('01',))
-    return t, u, _count_processes(), _count_threads()
+    return _count_tcp(), u, _count_processes(), _count_threads()
 
 def get_network(ip_version):
     # 路由器定制：探测域名改 ipchaxun（大陆可达）
