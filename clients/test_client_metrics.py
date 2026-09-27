@@ -1,3 +1,4 @@
+import io
 import runpy
 import sys
 import threading
@@ -20,6 +21,16 @@ def load_client(filename):
         except ImportError:
             sys.modules["psutil"] = types.ModuleType("psutil")
     return runpy.run_path(str(CLIENT_DIR / filename))
+
+
+def open_from(mapping):
+    """按路径返回内容；不在映射里的路径抛 FileNotFoundError（模拟该文件不存在）。
+    用 StringIO 而非 mock_open：后者不支持 next()，表头不会被跳过。"""
+    def _open(path, *args, **kwargs):
+        if path in mapping:
+            return io.StringIO(mapping[path])
+        raise FileNotFoundError(path)
+    return _open
 
 
 class ClientMetricTests(unittest.TestCase):
@@ -371,6 +382,73 @@ veth123: 8000 8 0 0 0 0 0 0 8000 8 0 0 0 0 0 0
         self.assertIn("array['tcp'], array['udp'], array['process'], array['thread'] = _tupd_snapshot", source)
         self.assertNotIn("psutil.process_iter()", source)
         self.assertEqual(load_client("client-psutil.py")["TUP_INTERVAL"], 3)
+
+    # --- Linux tupd（tcp/udp/进程/线程计数）--------------------------------
+
+    def test_linux_tupd_counts_sockets_from_proc(self):
+        """直读 /proc 的口径必须与 ss 一致：tcp 排除 LISTEN(0A)/TIME_WAIT(06)/SYN_RECV(03)，
+        udp 只计已连接(01)。状态码是 /proc/net/{tcp,udp}{,6} 每行的第 4 列。"""
+        client = load_client("client-linux.py")
+        proc_net = {
+            "/proc/net/tcp": (
+                "  sl  local_address rem_address   st\n"
+                "   0: 0100007F:1F90 00000000:0000 0A\n"   # LISTEN     → 排除
+                "   1: 0100007F:1F91 0100007F:1F92 01\n"   # ESTABLISHED→ 计入
+                "   2: 0100007F:1F93 0100007F:1F94 06\n"   # TIME_WAIT  → 排除
+                "   3: 0100007F:1F95 0100007F:1F96 03\n"   # SYN_RECV   → 排除
+                "   4: 0100007F:1F97 0100007F:1F98 08\n"   # CLOSE_WAIT → 计入
+                "   5: 0100007F:1F99 0100007F:1F9A 02\n"   # SYN_SENT   → 计入
+            ),
+            # 不提供 tcp6/udp6：IPv6 关闭时就是这种情形，必须走 IOError 分支而不是报错
+            "/proc/net/udp": (
+                "  sl  local_address rem_address   st\n"
+                "   0: 00000000:0044 00000000:0000 07\n"   # 未连接  → 排除
+                "   1: 0100007F:0045 0100007F:0046 01\n"   # 已连接  → 计入
+            ),
+            "/proc/loadavg": "0.00 0.01 0.05 1/857 12345\n",
+        }
+        with mock.patch("builtins.open", side_effect=open_from(proc_net)), \
+                mock.patch.object(client["os"], "listdir",
+                                  return_value=["1", "2", "855", "net", "self"]):
+            self.assertEqual(client["tupd"](), (3, 1, 3, 857))
+
+    def test_linux_tupd_falls_back_to_ss_when_proc_is_absent(self):
+        """无 /proc 的平台（macOS/BSD）必须退回 ss/ps 原实现，不能抛异常——
+        原实现缺 ss 时只是管道退化成 -1，直读则会直接抛 OSError。"""
+        client = load_client("client-linux.py")
+        calls = []
+        outputs = {"ss -t|wc -l": b"11\n", "ss -u|wc -l": b"6\n",
+                   "ps -ef|wc -l": b"21\n", "ps -eLf|wc -l": b"41\n"}
+
+        def fake_check_output(cmd, **kwargs):
+            calls.append(cmd)
+            return outputs[cmd]
+
+        with mock.patch.object(client["os"], "listdir", side_effect=FileNotFoundError), \
+                mock.patch.object(client["subprocess"], "check_output", side_effect=fake_check_output):
+            self.assertEqual(client["tupd"](), (10, 5, 19, 39))
+        self.assertEqual(calls, ["ss -t|wc -l", "ss -u|wc -l", "ps -ef|wc -l", "ps -eLf|wc -l"])
+
+    def test_linux_tupd_hot_path_avoids_subprocess(self):
+        """护栏：tupd 正常路径不得再起子进程。这四条命令每秒 12 次 fork/exec，
+        子进程 CPU 实测 30~115ms/s（客户端自身看不到，只在 RUSAGE_CHILDREN 里）。"""
+        source = (CLIENT_DIR / "client-linux.py").read_text(encoding="utf-8")
+        self.assertIn("_count_sockets(('/proc/net/tcp', '/proc/net/tcp6')", source)
+        self.assertIn("_count_sockets(('/proc/net/udp', '/proc/net/udp6'), keep=('01',))", source)
+        self.assertIn("return _tupd_subprocess()", source)
+        # 计数口径：ss -t 默认排除的三态
+        self.assertIn("_TCP_STATE_EXCLUDE = ('03', '06', '0A')", source)
+
+    def test_linux_tupd_matches_subprocess_counts(self):
+        """真机对账：直读 /proc 与 ss/ps 的计数必须接近。连接数/进程数在两次调用之间
+        会抖动（docker 容器起落），留 5% 或 5 的余量。"""
+        if not sys.platform.startswith("linux"):
+            return
+        client = load_client("client-linux.py")
+        native = client["tupd"]()
+        legacy = client["_tupd_subprocess"]()
+        for name, a, b in zip(("tcp", "udp", "process", "thread"), native, legacy):
+            self.assertLessEqual(abs(a - b), max(5, b // 20), name)
 
     # --- Windows 专项优化 -------------------------------------------------
 

@@ -268,11 +268,37 @@ def liuliang():
                 NET_OUT += int(netinfo[0][9])
     return NET_IN, NET_OUT
 
-def tupd():
-    '''
-    tcp, udp, process, thread count: for view ddcc attack , then send warning
-    :return:
-    '''
+# ss -t 默认过滤掉 LISTEN(0A)、TIME_WAIT(06) 与 SYN_RECV(03)，直读 /proc 时按同一口径排除
+_TCP_STATE_EXCLUDE = ('03', '06', '0A')
+
+def _count_sockets(paths, keep=(), exclude=()):
+    # /proc/net/{tcp,udp}{,6} 每行第 4 列是状态码（内核 tcp_states.h）；
+    # 只切前 4 个字段，整行 split 在几千条连接时要多花一倍时间
+    n = 0
+    for path in paths:
+        try:
+            with open(path) as f:
+                next(f, None)  # 跳过表头
+                for line in f:
+                    parts = line.split(None, 4)
+                    if len(parts) < 4:
+                        continue
+                    if parts[3] in exclude or (keep and parts[3] not in keep):
+                        continue
+                    n += 1
+        except IOError:
+            pass
+    return n
+
+def _count_processes():
+    return sum(1 for name in os.listdir('/proc') if name.isdigit())
+
+def _count_threads():
+    # /proc/loadavg 第 4 段形如 "2/899"，斜杠后是内核调度实体（线程）总数
+    with open('/proc/loadavg') as f:
+        return int(f.read().split()[3].split('/')[1])
+
+def _tupd_subprocess():
     s = subprocess.check_output("ss -t|wc -l", shell=True)
     t = int(s[:-1])-1
     s = subprocess.check_output("ss -u|wc -l", shell=True)
@@ -282,6 +308,21 @@ def tupd():
     s = subprocess.check_output("ps -eLf|wc -l", shell=True)
     d = int(s[:-1])-2
     return t,u,p,d
+
+def tupd():
+    '''
+    tcp, udp, process, thread count: for view ddcc attack , then send warning
+    :return:
+    '''
+    # 直读 /proc 代替 ss/ps 子进程；非 Linux（macOS/BSD 无 /proc）退回原命令
+    try:
+        p = _count_processes()
+        return (_count_sockets(('/proc/net/tcp', '/proc/net/tcp6'), exclude=_TCP_STATE_EXCLUDE),
+                _count_sockets(('/proc/net/udp', '/proc/net/udp6'), keep=('01',)),
+                p,
+                _count_threads())
+    except (OSError, ValueError, IndexError):
+        return _tupd_subprocess()
 
 def get_network(ip_version):
     if(ip_version == 4):
