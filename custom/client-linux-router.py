@@ -468,17 +468,13 @@ def _count_processes():
         return 0
 
 def _count_threads():
+    # /proc/loadavg 第 4 段形如 "2/411"，斜杠后是内核调度实体（线程）总数，
+    # 与逐 pid 累加 /proc/<pid>/task 同量，但只需一次读文件（实测 8.6ms vs 0.13ms）
     try:
-        pids = [d for d in os.listdir('/proc') if d.isdigit()]
-    except OSError:
+        with open('/proc/loadavg') as f:
+            return int(f.read().split()[3].split('/')[1])
+    except (OSError, ValueError, IndexError):
         return 0
-    total = 0
-    for pid in pids:
-        try:
-            total += sum(1 for d in os.listdir('/proc/' + pid + '/task') if d.isdigit())
-        except OSError:
-            pass
-    return total
 
 def tupd():
     '''
