@@ -442,20 +442,52 @@ def liuliang():
         f.write(f'{total_in} {total_out} {NET_IN} {NET_OUT} {uptime}')
     return total_in, total_out
 
+# /proc/net/tcp 状态码(hex)见内核 tcp_states.h。对齐原 ss 语义：
+#   ss -t 排除 TIME_WAIT(06) 与 LISTEN(0A)；ss -u 仅计已连接(01)
+def _count_sockets(paths, keep=(), exclude=()):
+    n = 0
+    for path in paths:
+        try:
+            with open(path) as f:
+                next(f, None)  # 跳过表头
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 4:
+                        continue
+                    if parts[3] in exclude or (keep and parts[3] not in keep):
+                        continue
+                    n += 1
+        except IOError:
+            pass
+    return n
+
+def _count_processes():
+    try:
+        return sum(1 for d in os.listdir('/proc') if d.isdigit())
+    except OSError:
+        return 0
+
+def _count_threads():
+    try:
+        pids = [d for d in os.listdir('/proc') if d.isdigit()]
+    except OSError:
+        return 0
+    total = 0
+    for pid in pids:
+        try:
+            total += sum(1 for d in os.listdir('/proc/' + pid + '/task') if d.isdigit())
+        except OSError:
+            pass
+    return total
+
 def tupd():
     '''
     tcp, udp, process, thread count: for view ddcc attack , then send warning
     :return:
     '''
-    s = subprocess.check_output("ss -t|wc -l", shell=True)
-    t = int(s[:-1])-1
-    s = subprocess.check_output("ss -u|wc -l", shell=True)
-    u = int(s[:-1])-1
-    s = subprocess.check_output("ps -ef|wc -l", shell=True)
-    p = int(s[:-1])-2
-    s = subprocess.check_output("ps -eLf|wc -l", shell=True)
-    d = int(s[:-1])-2
-    return t,u,p,d
+    t = _count_sockets(('/proc/net/tcp', '/proc/net/tcp6'), exclude=('06', '0A'))
+    u = _count_sockets(('/proc/net/udp', '/proc/net/udp6'), keep=('01',))
+    return t, u, _count_processes(), _count_threads()
 
 def get_network(ip_version):
     # 路由器定制：探测域名改 ipchaxun（大陆可达）
