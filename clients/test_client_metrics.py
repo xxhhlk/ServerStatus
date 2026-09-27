@@ -151,6 +151,26 @@ veth123: 8000 8 0 0 0 0 0 0 8000 8 0 0 0 0 0 0
             for name in ("lo", "ifb0", "tailscale0", "docker0", "veth123", "br-abc", "bond0"):
                 self.assertFalse(predicate(name), name)
 
+    def test_linux_interface_filter_result_is_cached(self):
+        """物理性分类是静态的，必须按接口名缓存：liuliang 与 _net_speed 每轮各调一遍，
+        不缓存等于每秒对每个接口重复 stat。"""
+        client = load_client("client-linux.py")
+        exists_calls = []
+        device_links = {client["os"].path.join("/sys/class/net", name, "device")
+                        for name in ("eth0", "wlan0")}
+
+        def fake_exists(path):
+            exists_calls.append(path)
+            return path in device_links
+
+        with mock.patch.object(client["os"].path, "exists", side_effect=fake_exists):
+            predicate = client["_is_physical_interface"]
+            for _ in range(3):
+                self.assertTrue(predicate("eth0"))
+                self.assertTrue(predicate("wlan0"))
+                self.assertFalse(predicate("lo"))
+        self.assertEqual(len(exists_calls), 3)   # 三个接口各只 stat 一次
+
     def test_interface_filter_keeps_wlo_and_excludes_virtual_interfaces(self):
         """回归：名字子串匹配 'lo' in k 会误杀 wlo1 无线网卡（上游 050b107 修复点）。
         本分支改用 sysfs 物理性判定，天然不受子串误杀影响。"""
@@ -386,6 +406,17 @@ veth123: 8000 8 0 0 0 0 0 0 8000 8 0 0 0 0 0 0
                 mock.patch("builtins.open", mock.mock_open(read_data='ID=alpine\n')) as open_mock:
             self.assertEqual(client["get_os_name"](), "alpine")
             self.assertEqual(client["get_os_name"](), "alpine")
+        self.assertEqual(open_mock.call_count, 1)
+
+    def test_linux_os_name_is_cached(self):
+        """get_os_name 的结果是常量，进程内只取一次：platform.system() 与 /etc/os-release
+        都不变，主循环每轮重算是纯浪费（client-psutil 已有同样的 _os_name 缓存）。"""
+        client = load_client("client-linux.py")
+        with mock.patch.object(client["platform"], "system", return_value="Linux") as system_mock, \
+                mock.patch("builtins.open", mock.mock_open(read_data='ID=alpine\n')) as open_mock:
+            self.assertEqual(client["get_os_name"](), "alpine")
+            self.assertEqual(client["get_os_name"](), "alpine")
+        self.assertEqual(system_mock.call_count, 1)
         self.assertEqual(open_mock.call_count, 1)
 
     def test_tupd_sampling_moved_out_of_main_loop(self):

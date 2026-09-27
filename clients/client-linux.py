@@ -217,40 +217,52 @@ def get_cpu_model():
         return vendor
     return normalize_cpu_model(lscpu.get('architecture') or platform.machine() or platform.processor())
 
+_physical_iface = {}
+
 def _is_physical_interface(name):
     # 只统计内核在 /sys/class/net/<iface>/device 下挂了真实硬件链接的网卡。
     # 自动排除 lo / ifb* / tailscale* / docker0 / br-* / veth* / bond* / macvlan* / dummy* 等
     # 虚拟接口，无需维护名字黑名单（且永远补不全，曾漏掉 ifb0、tailscale0 导致流量虚高数倍）。
     # VLAN 子接口(eth0.100)也没有 device 链接，其流量已在父口体现，排除可避免重复计。
-    return os.path.exists(os.path.join('/sys/class/net', name, 'device'))
+    # 分类是静态的，按接口名缓存：liuliang 与 _net_speed 每轮各调一遍，不缓存等于每秒重复 stat。
+    if name not in _physical_iface:
+        _physical_iface[name] = os.path.exists(os.path.join('/sys/class/net', name, 'device'))
+    return _physical_iface[name]
+
+_os_name = None
 
 def get_os_name():
+    # 结果是常量（platform.system() 与 /etc/os-release 都不变），进程内只取一次
+    global _os_name
+    if _os_name is not None:
+        return _os_name
     try:
         sysname = platform.system().lower()
         if sysname.startswith('linux'):
-            os_name = 'linux'
+            _os_name = 'linux'
             try:
                 with open('/etc/os-release') as f:
                     for line in f:
                         if line.startswith('ID='):
                             value = line.strip().split('=', 1)[1].strip().strip('"')
                             if value:
-                                os_name = value
+                                _os_name = value
                             break
             except Exception:
                 pass
-            return os_name
-        if sysname.startswith('darwin'):
-            return 'darwin'
-        if sysname.startswith('freebsd'):
-            return 'freebsd'
-        if sysname.startswith('openbsd'):
-            return 'openbsd'
-        if sysname.startswith('netbsd'):
-            return 'netbsd'
-        return sysname or 'unknown'
+        elif sysname.startswith('darwin'):
+            _os_name = 'darwin'
+        elif sysname.startswith('freebsd'):
+            _os_name = 'freebsd'
+        elif sysname.startswith('openbsd'):
+            _os_name = 'openbsd'
+        elif sysname.startswith('netbsd'):
+            _os_name = 'netbsd'
+        else:
+            _os_name = sysname or 'unknown'
     except Exception:
         return 'unknown'
+    return _os_name
 
 def liuliang():
     NET_IN = 0
