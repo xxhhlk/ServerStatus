@@ -471,57 +471,54 @@ def _disk_io():
     磁盘读写有误差：4k，8k ，https://stackoverflow.com/questions/34413926/psutil-vs-dd-monitoring-disk-i-o
     :return:
     '''
+    # 每轮只扫一遍 /proc，与上一轮快照求差。旧实现同一轮扫两遍（中间 sleep），
+    # 每 pid 4 次 open/read/close，进程越多越贵；差值区间仍是本线程的周期（≈INTERVAL）。
+    # comm 只在 pid 首次出现或 io 计数回退（疑似 pid 被复用）时重读——实测读 comm 比读 io 还贵。
+    prev = {}
     while True:
-        # pre pid snapshot
-        snapshot_first = {}
-        # next pid snapshot
-        snapshot_second = {}
-        # read count snapshot
-        snapshot_read = 0
-        # write count snapshot
-        snapshot_write = 0
-        # process snapshot
-        pid_snapshot = [str(i) for i in os.listdir("/proc") if i.isdigit() is True]
-        for pid in pid_snapshot:
-            try:
-                with open("/proc/{}/io".format(pid)) as f:
-                    pid_io = {}
-                    for line in f.readlines():
-                        if "read_bytes" in line:
-                            pid_io["read"] = int(line.split("read_bytes:")[-1].strip())
-                        elif "write_bytes" in line and "cancelled_write_bytes" not in line:
-                            pid_io["write"] = int(line.split("write_bytes:")[-1].strip())
-                    pid_io["name"] = open("/proc/{}/comm".format(pid), "r").read().strip()
-                    snapshot_first[pid] = pid_io
-            except:
-                if pid in snapshot_first:
-                    snapshot_first.pop(pid)
+        try:
+            curr = {}
+            for pid in os.listdir("/proc"):
+                if not pid.isdigit():
+                    continue
+                try:
+                    with open("/proc/{}/io".format(pid)) as f:
+                        pid_io = {}
+                        for line in f:
+                            if "read_bytes" in line:
+                                pid_io["read"] = int(line.split("read_bytes:")[-1].strip())
+                            elif "write_bytes" in line and "cancelled_write_bytes" not in line:
+                                pid_io["write"] = int(line.split("write_bytes:")[-1].strip())
+                    if "read" not in pid_io or "write" not in pid_io:
+                        continue
+                    last = prev.get(pid)
+                    if last is None or pid_io["read"] < last[0] or pid_io["write"] < last[1]:
+                        with open("/proc/{}/comm".format(pid), "r") as f:
+                            name = f.read().strip()
+                    else:
+                        name = last[2]
+                    curr[pid] = (pid_io["read"], pid_io["write"], name)
+                except (OSError, ValueError):
+                    continue
 
+            snapshot_read = 0
+            snapshot_write = 0
+            for pid, (read, write, name) in curr.items():
+                last = prev.get(pid)
+                if last is None or name == "bash":
+                    continue
+                # pid 被复用（名字变了或计数回退）时本轮不计：旧实现会据此算出负值
+                if last[2] != name or read < last[0] or write < last[1]:
+                    continue
+                snapshot_read += read - last[0]
+                snapshot_write += write - last[1]
+            diskIO["read"] = snapshot_read
+            diskIO["write"] = snapshot_write
+            prev = curr
+        except Exception:
+            # 单轮失败保留上一轮的值，下一轮重试；线程不得因瞬时错误退出
+            pass
         time.sleep(INTERVAL)
-
-        for pid in pid_snapshot:
-            try:
-                with open("/proc/{}/io".format(pid)) as f:
-                    pid_io = {}
-                    for line in f.readlines():
-                        if "read_bytes" in line:
-                            pid_io["read"] = int(line.split("read_bytes:")[-1].strip())
-                        elif "write_bytes" in line and "cancelled_write_bytes" not in line:
-                            pid_io["write"] = int(line.split("write_bytes:")[-1].strip())
-                    pid_io["name"] = open("/proc/{}/comm".format(pid), "r").read().strip()
-                    snapshot_second[pid] = pid_io
-            except:
-                if pid in snapshot_first:
-                    snapshot_first.pop(pid)
-                if pid in snapshot_second:
-                    snapshot_second.pop(pid)
-
-        for k, v in snapshot_first.items():
-            if snapshot_first[k]["name"] == snapshot_second[k]["name"] and snapshot_first[k]["name"] != "bash":
-                snapshot_read += (snapshot_second[k]["read"] - snapshot_first[k]["read"])
-                snapshot_write += (snapshot_second[k]["write"] - snapshot_first[k]["write"])
-        diskIO["read"] = snapshot_read
-        diskIO["write"] = snapshot_write
 
 def get_realtime_data():
     '''

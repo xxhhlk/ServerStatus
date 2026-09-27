@@ -33,6 +33,20 @@ def open_from(mapping):
     return _open
 
 
+class _LoopStop(Exception):
+    """用来从 while True 的线程体里退出（替换 time.sleep 时抛出）。"""
+
+
+def run_loop_with_fake_sleep(fn, sleep_hook):
+    """跑客户端里 while True 的线程体：把 fn 所在命名空间的 time.sleep 换成 sleep_hook
+    （由它抛 _LoopStop 结束循环）。只改 runpy 命名空间里的 time，不动真实 time 模块。"""
+    with mock.patch.dict(fn.__globals__, {"time": types.SimpleNamespace(sleep=sleep_hook)}):
+        try:
+            fn()
+        except _LoopStop:
+            pass
+
+
 class ClientMetricTests(unittest.TestCase):
     # --- 网卡过滤 ---------------------------------------------------------
     # 本分支用「物理性」判定而非名字黑名单：Linux 看 /sys/class/net/<if>/device，
@@ -449,6 +463,84 @@ veth123: 8000 8 0 0 0 0 0 0 8000 8 0 0 0 0 0 0
         legacy = client["_tupd_subprocess"]()
         for name, a, b in zip(("tcp", "udp", "process", "thread"), native, legacy):
             self.assertLessEqual(abs(a - b), max(5, b // 20), name)
+
+    # --- Linux _disk_io（单轮扫描 + comm 缓存）----------------------------
+
+    def test_linux_disk_io_diffs_consecutive_rounds(self):
+        """单轮化：每轮只扫一遍 /proc，与上一轮快照求差（旧实现同一轮扫两遍）。
+        只累加同名且计数不回退的 pid 差值、排除 bash；comm 走缓存，仅新 pid / 计数回退时重读。"""
+        client = load_client("client-linux.py")
+        io_rounds = {
+            "100": [(1000, 2000), (1500, 2600)],   # 稳定增长 → 计 500/600
+            "200": [(10, 20), (30, 40)],           # bash → 两轮都不计
+            "300": [(500, 600), (5, 6)],           # 计数回退 → pid 复用，本轮不计
+            "400": [(0, 0), (50, 60)],             # 第二轮才出现 → 无上一轮快照，不计
+        }
+        names = {"100": "worker", "200": "bash", "300": "worker", "400": "newcomer"}
+        pids_rounds = [["100", "200", "300", "net"],
+                       ["100", "200", "300", "400", "self"]]
+        opened = []
+        round_idx = [0]
+
+        def fake_open(path, *args, **kwargs):
+            opened.append(path)
+            _, _, pid, kind = path.split("/")
+            if kind == "io":
+                read, write = io_rounds[pid][round_idx[0]]
+                return io.StringIO("rchar: 0\nwchar: 0\nread_bytes: %d\nwrite_bytes: %d\n"
+                                   "cancelled_write_bytes: 0\n" % (read, write))
+            return io.StringIO(names[pid] + "\n")
+
+        def fake_sleep(_seconds):
+            round_idx[0] += 1
+            if round_idx[0] >= len(pids_rounds):
+                raise _LoopStop
+
+        with mock.patch("builtins.open", side_effect=fake_open), \
+                mock.patch.object(client["os"], "listdir",
+                                  side_effect=lambda _p: pids_rounds[round_idx[0]]):
+            run_loop_with_fake_sleep(client["_disk_io"], fake_sleep)
+
+        self.assertEqual(client["diskIO"], {"read": 500, "write": 600})
+        # comm 只在新 pid（首轮）与计数回退时读；稳定 pid 第二轮命中缓存
+        self.assertEqual(opened.count("/proc/100/comm"), 1)
+        self.assertEqual(opened.count("/proc/200/comm"), 1)
+        self.assertEqual(opened.count("/proc/300/comm"), 2)
+        self.assertEqual(opened.count("/proc/400/comm"), 1)
+
+    def test_linux_disk_io_survives_transient_error(self):
+        """单轮扫描抛异常（如 /proc 瞬时不可读）不得让线程退出：保留上一轮的值与快照，
+        下一轮继续——差值自然跨越失败的那一轮，而不是整条线程消失。"""
+        client = load_client("client-linux.py")
+        io_rounds = {"100": [(100, 200), None, (300, 400)]}
+        opened = []
+        round_idx = [0]
+
+        def fake_open(path, *args, **kwargs):
+            opened.append(path)
+            _, _, pid, kind = path.split("/")
+            if kind == "io":
+                read, write = io_rounds[pid][round_idx[0]]
+                return io.StringIO("read_bytes: %d\nwrite_bytes: %d\n" % (read, write))
+            return io.StringIO("worker\n")
+
+        def fake_listdir(_path):
+            if round_idx[0] == 1:
+                raise OSError("proc busy")
+            return ["100", "net"]
+
+        def fake_sleep(_seconds):
+            round_idx[0] += 1
+            if round_idx[0] >= len(io_rounds["100"]):
+                raise _LoopStop
+
+        with mock.patch("builtins.open", side_effect=fake_open), \
+                mock.patch.object(client["os"], "listdir", side_effect=fake_listdir):
+            run_loop_with_fake_sleep(client["_disk_io"], fake_sleep)
+
+        # 第 1 轮失败被跳过，第 2 轮与第 0 轮的快照求差（跨越失败轮）
+        self.assertEqual(client["diskIO"], {"read": 200, "write": 200})
+        self.assertEqual(opened.count("/proc/100/comm"), 1)
 
     # --- Windows 专项优化 -------------------------------------------------
 
