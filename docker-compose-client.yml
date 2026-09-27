@@ -23,6 +23,7 @@ services:
       serverstatus_PING_PACKET_HISTORY_LEN: "${serverstatus_PING_PACKET_HISTORY_LEN:-100}"
       serverstatus_DNS_REFRESH_INTERVAL: "${serverstatus_DNS_REFRESH_INTERVAL:-30}"
       serverstatus_NET_PROBE_INTERVAL: "${serverstatus_NET_PROBE_INTERVAL:-30}"
+      serverstatus_TUP_INTERVAL: "${serverstatus_TUP_INTERVAL:-3}"
       serverstatus_CU: "${serverstatus_CU:-cu.tz.cloudcpp.com}"
       serverstatus_CT: "${serverstatus_CT:-ct.tz.cloudcpp.com}"
       serverstatus_CM: "${serverstatus_CM:-cm.tz.cloudcpp.com}"

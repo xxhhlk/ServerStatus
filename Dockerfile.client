@@ -19,6 +19,7 @@ ENV serverstatus_SERVER=127.0.0.1 \
     serverstatus_PING_PACKET_HISTORY_LEN=100 \
     serverstatus_DNS_REFRESH_INTERVAL=30 \
     serverstatus_NET_PROBE_INTERVAL=30 \
+    serverstatus_TUP_INTERVAL=3 \
     serverstatus_CU=cu.tz.cloudcpp.com \
     serverstatus_CT=ct.tz.cloudcpp.com \
     serverstatus_CM=cm.tz.cloudcpp.com \

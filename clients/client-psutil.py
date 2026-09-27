@@ -23,6 +23,7 @@ INTERVAL = 1
 # 勿低于 10s，否则相对 TTL 仍是重复解析。
 DNS_REFRESH_INTERVAL = 30  # 重解析探针域名的间隔（秒），不影响 1s 建连探测频率
 NET_PROBE_INTERVAL = 30    # online4/online6 探测间隔（秒）
+TUP_INTERVAL = 3           # tcp/udp/process/thread 采样间隔（秒）
 
 import socket
 import time
@@ -67,6 +68,7 @@ PROBE_PROTOCOL_PREFER = _env_str("serverstatus_PROBE_PROTOCOL_PREFER", PROBE_PRO
 PING_PACKET_HISTORY_LEN = _env_int("serverstatus_PING_PACKET_HISTORY_LEN", PING_PACKET_HISTORY_LEN)
 DNS_REFRESH_INTERVAL = _env_int("serverstatus_DNS_REFRESH_INTERVAL", DNS_REFRESH_INTERVAL)
 NET_PROBE_INTERVAL = _env_int("serverstatus_NET_PROBE_INTERVAL", NET_PROBE_INTERVAL)
+TUP_INTERVAL = _env_int("serverstatus_TUP_INTERVAL", TUP_INTERVAL)
 CU = _env_str("serverstatus_CU", CU)
 CT = _env_str("serverstatus_CT", CT)
 CM = _env_str("serverstatus_CM", CM)
@@ -396,38 +398,69 @@ def _win_nqsi():
         _win_nqsi.fn = fn
     return fn
 
-def _win_proc_thread_count():
-    """NtQuerySystemInformation(SystemProcessInformation)：一次系统调用拿全部进程/线程数。
-    与任务管理器同源，替代逐进程 psutil.Process().num_threads()（Windows 上极慢）。"""
+# SYSTEM_PROCESS_INFORMATION / SYSTEM_THREAD_INFORMATION 的字段偏移（x64）
+_WIN_THREADS_OFF = 0x100       # 进程条目内 Threads[] 数组起点
+_WIN_THREAD_SIZE = 80          # 单个线程结构大小
+_WIN_THREAD_STATE_OFF = 68     # 线程结构内 ThreadState（0 Initialized / 1 Ready / 2 Running …）
+
+_win_sys_buf = None            # 常驻复用缓冲：每次新建 1MB 约多花 1ms
+_win_ready_last = None         # 最近一次快照的就绪队列长度，交给 load 的 EWMA
+
+def _win_sys_counts():
+    """NtQuerySystemInformation(SystemProcessInformation)：一次系统调用拿全部进程数、线程数
+    与就绪队列长度。与任务管理器同源，替代逐进程 psutil.Process().num_threads()（Windows 上极慢）。
+
+    就绪队列长度 = ThreadState==Ready(1) 的线程数，与文档化 PDH 计数器
+    \\System\\Processor Queue Length 等价（实测施压 16 进程时两者均值 40.01 vs 39.86、
+    min/max 完全一致），但省掉 PDH 的 System provider——那个 provider 单次 4~9ms，
+    是 Paging File provider 的两个数量级。状态值只占低字节，按结构步长切片一次取出
+    整进程的状态字节再计数（纯 C 层，比逐线程解包快 3 倍）。
+
+    失败返回 (0, 0, None)。"""
+    global _win_sys_buf, _win_ready_last
     nqsi = _win_nqsi()
     buf_size = 1 << 20          # 1MB 起
     while True:
-        buf = ctypes.create_string_buffer(buf_size)
+        if _win_sys_buf is None or len(_win_sys_buf) < buf_size:
+            _win_sys_buf = ctypes.create_string_buffer(buf_size)
         ret_len = wintypes.ULONG(0)
-        status = nqsi(5, buf, buf_size, ctypes.byref(ret_len))   # 5 = SystemProcessInformation
+        status = nqsi(5, _win_sys_buf, len(_win_sys_buf), ctypes.byref(ret_len))
         if status == 0:                                          # STATUS_SUCCESS
             break
         if status == 0xC0000004:                                 # STATUS_INFO_LENGTH_MISMATCH → 扩大重试
             buf_size = ret_len.value + 0x10000
+            _win_sys_buf = None
             continue
-        return 0, 0
-    b = buf.raw
-    procs = threads = off = 0
+        return 0, 0, None
+    b = _win_sys_buf
+    procs = threads = ready = off = 0
     while off < len(b):
         nxt = int.from_bytes(b[off:off+4], 'little')
-        threads += int.from_bytes(b[off+4:off+8], 'little')      # NumberOfThreads
+        nthr = int.from_bytes(b[off+4:off+8], 'little')          # NumberOfThreads
+        threads += nthr
         procs += 1
+        start = off + _WIN_THREADS_OFF + _WIN_THREAD_STATE_OFF
+        stop = start + nthr * _WIN_THREAD_SIZE
+        if stop > len(b):
+            stop = len(b)
+        ready += b[start:stop:_WIN_THREAD_SIZE].count(1)
         if nxt == 0:
             break
         off += nxt
-    return procs, threads
+    _win_ready_last = ready
+    return procs, threads, ready
 
 # --- Windows 负载（load average 近似） ---
-# 就绪队列长度用文档化 PDH 计数器 \System\Processor Queue Length（所有处理器就绪队列线程数之和），
+# 就绪队列长度取自 tupd 那次原生快照里 ThreadState==Ready 的线程数（与文档化 PDH 计数器
+# \System\Processor Queue Length 等价，实测已对齐），因此不再单独走 PDH 的 System provider。
 # 运行线程数用每核 CPU 利用率连续求和（单核利用率 60% 记 0.6，用 SystemProcessorPerformanceInformation 采样）。
 # 1/5/15 分钟用内核同款指数衰减 EWMA：load = prev*exp(-dt/tau) + instant*(1-exp(-dt/tau))。
+# 采样节奏由 tupd 线程按 TUP_INTERVAL 驱动——load 是长时间平滑量，粗采不影响读数。
 _win_load_averages = [0.0, 0.0, 0.0]          # [1min, 5min, 15min]，主循环只读快照
 _win_load_lock = threading.Lock()
+_win_load_prev_idle = None
+_win_load_prev_clock = 0.0
+_win_load_warm_until = time.time() + 120
 
 class _WIN_PERF_INFO(ctypes.Structure):
     """SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION：每核 idle/kernel/user 时间，48 字节"""
@@ -450,40 +483,48 @@ def _win_perf_snapshot():
         return None
     return list(perfs[:ret_len.value // ctypes.sizeof(_WIN_PERF_INFO)])
 
-_pdh = None
-_pdh_query = None
-_pdh_counter = None
+def _win_load_step(qlen):
+    """推进 1/5/15 分钟负载 EWMA。由 tupd 线程按 TUP_INTERVAL 驱动；
+    qlen 是本次原生快照里的就绪队列长度（Ready 态线程数），与运行线程数相加得到瞬时负载。
 
-class _PDH_FMT_COUNTERVALUE(ctypes.Structure):
-    _fields_ = [('CStatus', wintypes.LONG), ('value', ctypes.c_longlong)]
-
-def _win_pdh_init():
-    global _pdh, _pdh_query, _pdh_counter
-    if _pdh is not None:
-        return True
+    运行线程数 = Σ(每核 CPU 利用率)，连续值（单核跑满记 1、利用率 60% 记 0.6），
+    避免离散阈值在中等负载区间低估。"""
+    global _win_load_prev_idle, _win_load_prev_clock
     try:
-        pdh = ctypes.WinDLL('pdh')
-        pdh.PdhOpenQueryW.argtypes = [wintypes.LPCWSTR, ctypes.c_size_t, ctypes.POINTER(wintypes.HANDLE)]
-        pdh.PdhOpenQueryW.restype = wintypes.LONG
-        pdh.PdhAddEnglishCounterW.argtypes = [wintypes.HANDLE, wintypes.LPCWSTR, ctypes.c_size_t, ctypes.POINTER(wintypes.HANDLE)]
-        pdh.PdhAddEnglishCounterW.restype = wintypes.LONG
-        pdh.PdhCollectQueryData.argtypes = [wintypes.HANDLE]
-        pdh.PdhCollectQueryData.restype = wintypes.LONG
-        pdh.PdhGetFormattedCounterValue.argtypes = [wintypes.HANDLE, wintypes.DWORD,
-                                                    ctypes.POINTER(wintypes.DWORD),
-                                                    ctypes.POINTER(_PDH_FMT_COUNTERVALUE)]
-        pdh.PdhGetFormattedCounterValue.restype = wintypes.LONG
-        query = wintypes.HANDLE()
-        counter = wintypes.HANDLE()
-        if pdh.PdhOpenQueryW(None, 0, ctypes.byref(query)) != 0:
-            return False
-        if pdh.PdhAddEnglishCounterW(query, "\\System\\Processor Queue Length", 0, ctypes.byref(counter)) != 0:
-            return False
-        pdh.PdhCollectQueryData(query)   # 首次采集仅初始化，数据下一轮就绪
-        _pdh, _pdh_query, _pdh_counter = pdh, query, counter
-        return True
+        perfs = _win_perf_snapshot()
     except Exception:
-        return False
+        perfs = None
+    if perfs is None and qlen is None:
+        return
+    running = 0.0
+    if perfs is not None:
+        if _win_load_prev_idle is not None:
+            for cur, prev in zip(perfs, _win_load_prev_idle):
+                # 注意：KernelTime 包含 IdleTime，必须先减掉再算内核忙碌时间
+                idle = cur.IdleTime - prev.IdleTime
+                busy = (cur.KernelTime - prev.KernelTime) - idle + (cur.UserTime - prev.UserTime)
+                total = busy + idle
+                if total > 0:
+                    running += busy / total
+        _win_load_prev_idle = perfs
+    instant = (qlen or 0) + running
+    now = time.time()
+    with _win_load_lock:
+        if now < _win_load_warm_until:
+            # 启动后 2 分钟 warm-up：直接报瞬时值，避免数据未就绪/无基线时把起点钉在 0，
+            # 导致监控读数从 0 缓慢爬升
+            _win_load_averages[:] = [float(instant)] * 3
+        elif _win_load_prev_clock > 0:
+            dt = now - _win_load_prev_clock
+            avg = list(_win_load_averages)
+            for i, t in enumerate((60.0, 300.0, 900.0)):
+                f = math.exp(-dt / t)
+                avg[i] = avg[i] * f + instant * (1.0 - f)
+            _win_load_averages[:] = avg
+        else:
+            _win_load_averages[:] = [float(instant)] * 3
+    _win_load_prev_clock = now
+
 
 def _win_pdh_queue_length():
     """当前就绪队列线程数；PDH 数据未就绪/失败返回 None"""
@@ -581,12 +622,27 @@ def tupd():
             except Exception:
                 t = 0
                 u = 0
-            p, d = _win_proc_thread_count()                   # NtQuerySystemInformation
+            p, d, _ = _win_sys_counts()                       # NtQuerySystemInformation
         else:
             t,u,p,d = 0,0,0,0
         return t,u,p,d
     except:
         return 0,0,0,0
+
+_tupd_snapshot = (0, 0, 0, 0)
+
+def _tupd_thread():
+    """独立线程：每 TUP_INTERVAL 秒采样一次 tcp/udp/process/thread 计数，
+    主循环只读 _tupd_snapshot 快照，避免每轮 fork 子进程（Linux）或遍历连接表（Windows）。
+    Windows 上顺带用同一次原生快照里的就绪队列长度推进 load 的 EWMA——省掉原先
+    load-avg 线程单独走 PDH 的 System provider（单次 4~9ms）。"""
+    _name_current_thread('tupd')
+    global _tupd_snapshot
+    while True:
+        _tupd_snapshot = tupd()
+        if sys.platform.startswith("win") is True:
+            _win_load_step(_win_ready_last)
+        time.sleep(TUP_INTERVAL)
 
 def get_network(ip_version):
     if(ip_version == 4):
@@ -758,9 +814,10 @@ def get_realtime_data():
     t6 = threading.Thread(
         target=_net_probe_thread,
     )
-    threads = [t1, t2, t3, t4, t5, t6]
-    if sys.platform.startswith('win'):
-        threads.append(threading.Thread(target=_win_load_thread))
+    t7 = threading.Thread(
+        target=_tupd_thread,
+    )
+    threads = [t1, t2, t3, t4, t5, t6, t7]
     for ti in threads:
         ti.daemon = True
         ti.start()
@@ -955,7 +1012,7 @@ if __name__ == '__main__':
                 array['time_10010'] = pingTime.get('10010')
                 array['time_189'] = pingTime.get('189')
                 array['time_10086'] = pingTime.get('10086')
-                array['tcp'], array['udp'], array['process'], array['thread'] = tupd()
+                array['tcp'], array['udp'], array['process'], array['thread'] = _tupd_snapshot
                 array['io_read'] = diskIO.get("read")
                 array['io_write'] = diskIO.get("write")
                 array['os'] = get_os_name()

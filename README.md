@@ -87,6 +87,7 @@ nohup python3 client-linux.py SERVER=127.0.0.1 USER=s01 PASSWORD=USER_DEFAULT_PA
 | `PING_PACKET_HISTORY_LEN` | `100` | 丢包历史窗口；丢包率统计窗口 = 该值 × `INTERVAL` |
 | `DNS_REFRESH_INTERVAL` | `30` | 三网探针域名重解析间隔，单位秒；只节流 DNS 查询，不改变建连探测频率 |
 | `NET_PROBE_INTERVAL` | `30` | `online4`/`online6` 探测间隔，单位秒 |
+| `TUP_INTERVAL` | `3` | `tcp`/`udp`/`process`/`thread` 采样间隔，单位秒；主循环只读快照 |
 | `CU` | `cu.tz.cloudcpp.com` | 联通探测地址 |
 | `CT` | `ct.tz.cloudcpp.com` | 电信探测地址 |
 | `CM` | `cm.tz.cloudcpp.com` | 移动探测地址 |
