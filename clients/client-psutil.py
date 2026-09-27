@@ -79,8 +79,33 @@ def parse_cli_args(arguments):
             overrides[key] = value
     return overrides
 
+def _name_current_thread(name):
+    """给当前线程命名：设 Python 名，并在 Windows 上补写原生线程描述。
+    Python 的 Thread(name=) 不会写原生描述（实测读回来为空），而 Process Explorer
+    以及按 tid 查名的诊断脚本都依赖它，所以这里补一次 SetThreadDescription。"""
+    threading.current_thread().name = name
+    if not sys.platform.startswith('win'):
+        return
+    try:
+        fn = getattr(_name_current_thread, 'setdesc', None)
+        if fn is None:
+            k32 = ctypes.windll.kernel32
+            fn = k32.SetThreadDescription
+            fn.argtypes = [wintypes.HANDLE, wintypes.LPCWSTR]
+            fn.restype = ctypes.c_long
+            _name_current_thread.setdesc = fn
+            _name_current_thread.getcur = k32.GetCurrentThread
+        fn(_name_current_thread.getcur(), name)
+    except Exception:
+        _name_current_thread.setdesc = None   # 绑定失败下次重试
+
+_boot_time = None
+
 def get_uptime():
-    return int(time.time() - psutil.boot_time())
+    global _boot_time
+    if _boot_time is None:
+        _boot_time = psutil.boot_time()
+    return int(time.time() - _boot_time)
 
 def _win_mem_no_cache():
     """GetPerformanceInfo：一次调用拿 total/free/SystemCache，used 排除系统缓存（近似 Linux cached 语义）。
@@ -119,7 +144,12 @@ def get_swap():
     Mem = psutil.swap_memory()
     return int(Mem.total/1024.0), int(Mem.used/1024.0)
 
+_hdd_mounts = None
+_hdd_mounts_clock = 0.0
+HDD_REFRESH_INTERVAL = 60  # 分区表重枚举间隔（秒），保证热插盘也能被发现
+
 def get_hdd():
+    global _hdd_mounts, _hdd_mounts_clock
     if "darwin" in sys.platform:
         return int(psutil.disk_usage("/").total/1024.0/1024.0), int((psutil.disk_usage("/").total-psutil.disk_usage("/").free)/1024.0/1024.0)
     elif sys.platform.startswith("win"):
@@ -128,15 +158,19 @@ def get_hdd():
         usage = psutil.disk_usage(sysdrive)
         return int(usage.total/1024.0/1024.0), int(usage.used/1024.0/1024.0)
     else:
-        valid_fs = ["ext4", "ext3", "ext2", "reiserfs", "jfs", "btrfs", "fuseblk", "zfs", "simfs", "ntfs", "fat32",
-                    "exfat", "xfs"]
-        disks = dict()
+        now = time.monotonic()
+        if _hdd_mounts is None or now - _hdd_mounts_clock > HDD_REFRESH_INTERVAL:
+            valid_fs = ["ext4", "ext3", "ext2", "reiserfs", "jfs", "btrfs", "fuseblk", "zfs", "simfs", "ntfs", "fat32",
+                        "exfat", "xfs"]
+            disks = dict()
+            for disk in psutil.disk_partitions():
+                if not disk.device in disks and disk.fstype.lower() in valid_fs:
+                    disks[disk.device] = disk.mountpoint
+            _hdd_mounts = list(disks.values())
+            _hdd_mounts_clock = now
         size = 0
         used = 0
-        for disk in psutil.disk_partitions():
-            if not disk.device in disks and disk.fstype.lower() in valid_fs:
-                disks[disk.device] = disk.mountpoint
-        for disk in disks.values():
+        for disk in _hdd_mounts:
             usage = psutil.disk_usage(disk)
             size += usage.total
             used += usage.used
@@ -281,7 +315,8 @@ def _sum_physical_counters(net):
     return total_in, total_out
 
 def _net_monitor():
-    """独立线程：唯一调用 psutil.net_io_counters 的地方，读累计值存全局并算网速"""
+    """独立线程：唯一读取网卡计数的地方，读累计值存全局并算网速"""
+    _name_current_thread('net-monitor')
     global _net_in, _net_out
     while True:
         try:
@@ -304,6 +339,7 @@ def _net_probe_thread():
     """独立线程：每 NET_PROBE_INTERVAL 秒探测一次 online4/online6（get_network），
     避免 DNS 卡死阻塞主循环上报。默认 30s 对 600s 的 offline warning 看门狗足够。
     主循环只读 _online_status 快照；_online_target 由主循环在连接后设置。"""
+    _name_current_thread('net-probe')
     global _online_status
     while True:
         target = _online_target
@@ -313,31 +349,37 @@ def _net_probe_thread():
             _online_status[target] = False
         time.sleep(NET_PROBE_INTERVAL)
 
+_os_name = None
+
 def get_os_name():
+    global _os_name
+    if _os_name is not None:
+        return _os_name
     try:
         sysname = platform.system().lower()
         if sysname.startswith('windows'):
-            return 'windows'
-        if sysname.startswith('darwin') or 'mac' in sysname:
-            return 'darwin'
-        if 'bsd' in sysname:
-            return 'bsd'
-        if sysname.startswith('linux'):
-            os_name = 'linux'
+            _os_name = 'windows'
+        elif sysname.startswith('darwin') or 'mac' in sysname:
+            _os_name = 'darwin'
+        elif 'bsd' in sysname:
+            _os_name = 'bsd'
+        elif sysname.startswith('linux'):
+            _os_name = 'linux'
             try:
                 with open('/etc/os-release') as f:
                     for line in f:
                         if line.startswith('ID='):
                             value = line.strip().split('=', 1)[1].strip().strip('"')
                             if value:
-                                os_name = value
+                                _os_name = value
                             break
             except Exception:
                 pass
-            return os_name
-        return sysname or 'unknown'
+        else:
+            _os_name = sysname or 'unknown'
     except Exception:
         return 'unknown'
+    return _os_name
 
 def liuliang():
     """主循环读取：只读独立线程存下的全局值，不调 psutil"""
@@ -605,6 +647,7 @@ def _should_resolve(host, last_resolve, now, interval):
     return last_resolve is None or now - last_resolve >= interval
 
 def _ping_thread(host, mark, port):
+    _name_current_thread('ping-' + str(mark))
     lostPacket = 0
     packet_queue = Queue(maxsize=PING_PACKET_HISTORY_LEN)
 
@@ -657,53 +700,23 @@ def _disk_io():
     good luck for opensource! modify: cpp.la
     Calculate IO usage by comparing IO statics before and
         after the interval.
-        Return a tuple including all currently running processes
-        sorted by IO activity and total disks I/O activity.
     磁盘IO：因为IOPS原因，SSD和HDD、包括RAID卡，ZFS等。IO对性能的影响还需要结合自身服务器情况来判断。
     比如我这里是机械硬盘，大量做随机小文件读写，那么很低的读写也就能造成硬盘长时间的等待。
     如果这里做连续性IO，那么普通机械硬盘写入到100Mb/s，那么也能造成硬盘长时间的等待。
     磁盘读写有误差：4k，8k ，https://stackoverflow.com/questions/34413926/psutil-vs-dd-monitoring-disk-i-o
     macos/win，暂不处理。
     """
+    _name_current_thread('disk-io')
     if "darwin" in sys.platform or "win" in sys.platform:
         diskIO["read"] = 0
         diskIO["write"] = 0
     else:
         while True:
-            # first get a list of all processes and disk io counters
-            procs = [p for p in psutil.process_iter()]
-            for p in procs[:]:
-                try:
-                    p._before = p.io_counters()
-                except psutil.Error:
-                    procs.remove(p)
-                    continue
-            disks_before = psutil.disk_io_counters()
-
             # sleep some time, only when INTERVAL==1 , io read/write per_sec.
             # when INTERVAL > 1, io read/write per_INTERVAL
+            disks_before = psutil.disk_io_counters()
             time.sleep(INTERVAL)
-
-            # then retrieve the same info again
-            for p in procs[:]:
-                with p.oneshot():
-                    try:
-                        p._after = p.io_counters()
-                        p._cmdline = ' '.join(p.cmdline())
-                        if not p._cmdline:
-                            p._cmdline = p.name()
-                        p._username = p.username()
-                    except (psutil.NoSuchProcess, psutil.ZombieProcess):
-                        procs.remove(p)
             disks_after = psutil.disk_io_counters()
-
-            # finally calculate results by comparing data before and
-            # after the interval
-            for p in procs:
-                p._read_per_sec = p._after.read_bytes - p._before.read_bytes
-                p._write_per_sec = p._after.write_bytes - p._before.write_bytes
-                p._total = p._read_per_sec + p._write_per_sec
-
             diskIO["read"] = disks_after.read_bytes - disks_before.read_bytes
             diskIO["write"] = disks_after.write_bytes - disks_before.write_bytes
 
@@ -753,7 +766,11 @@ def get_realtime_data():
         ti.start()
 
 def _monitor_thread(name, host, interval, type):
-    # 参考 _ping_thread 风格：每轮解析一次目标，按协议族偏好解析 IP，测 TCP 建连耗时
+    # 参考 _ping_thread 风格：按协议族偏好解析 IP，测 TCP 建连耗时
+    _name_current_thread('monitor-' + str(name))
+    IP = None
+    cached_ip = None
+    last_resolve = None
     while True:
         if name not in monitorServer:
             break
@@ -792,16 +809,21 @@ def _monitor_thread(name, host, interval, type):
                 time.sleep(interval)
                 continue
 
-            # 2) 解析 IP（按偏好族），与 _ping_thread 保持一致的判定
-            IP = addr
+            # 2) 解析 IP（按偏好族），与 _ping_thread 保持一致的判定与 DNS 节流
             if addr.count(':') < 1:  # 非纯 IPv6，可能是 IPv4 或域名
-                try:
-                    if PROBE_PROTOCOL_PREFER == 'ipv4':
-                        IP = socket.getaddrinfo(addr, None, socket.AF_INET)[0][4][0]
-                    else:
-                        IP = socket.getaddrinfo(addr, None, socket.AF_INET6)[0][4][0]
-                except Exception:
-                    pass
+                now = time.monotonic()
+                if _should_resolve(addr, last_resolve, now, DNS_REFRESH_INTERVAL):
+                    last_resolve = now
+                    try:
+                        if PROBE_PROTOCOL_PREFER == 'ipv4':
+                            cached_ip = socket.getaddrinfo(addr, None, socket.AF_INET)[0][4][0]
+                        else:
+                            cached_ip = socket.getaddrinfo(addr, None, socket.AF_INET6)[0][4][0]
+                    except Exception:
+                        pass
+                IP = cached_ip or addr
+            else:
+                IP = addr
 
             # 3) 测 TCP 建连耗时（timeout=1s）；ECONNREFUSED 也记为耗时
             try:
@@ -813,6 +835,7 @@ def _monitor_thread(name, host, interval, type):
                     monitorServer[name]['latency'] = int((timeit.default_timer() - b) * 1000)
                 else:
                     monitorServer[name]['latency'] = 0
+                    last_resolve = None  # 建连失败→下轮强制重解析，避免钉死已失效 IP
         except Exception:
             monitorServer[name]['latency'] = 0
         time.sleep(interval)
