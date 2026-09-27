@@ -109,7 +109,7 @@ def get_uptime():
         _boot_time = psutil.boot_time()
     return int(time.time() - _boot_time)
 
-def _win_mem_no_cache():
+def _win_mem_gpi():
     """GetPerformanceInfo：一次调用拿 total/free/SystemCache，used 排除系统缓存（近似 Linux cached 语义）。
     返回 (total_kb, used_kb)；失败返回 None。"""
     import ctypes
@@ -134,6 +134,68 @@ def _win_mem_no_cache():
     cache = pi.SystemCache * page        # standby + modified + 活动映射
     return int(total/1024.0), int((total - free - cache)/1024.0)
 
+# NtQuerySystemInformation 的信息类与字段偏移（x64，未文档化；取值均与 GetPerformanceInfo 同源同值）
+_WIN_PERF_AVAIL_OFF = 0x2C      # class 2  SystemPerformanceInformation：AvailablePages
+_WIN_CACHE_SIZE_OFF = 0x28      # class 21 SystemFileCacheInformation：当前文件缓存页数
+
+_win_mem_buf = None             # NQSI(2)/NQSI(21) 共用的常驻缓冲
+_win_mem_native_ok = None       # None 未自检 / True 可用 / False 永久退回 GetPerformanceInfo
+
+def _win_page_size():
+    """系统页大小（字节），GetSystemInfo 惰性调用一次"""
+    v = getattr(_win_page_size, 'v', None)
+    if v is None:
+        buf = ctypes.create_string_buffer(64)
+        ctypes.windll.kernel32.GetSystemInfo(ctypes.byref(buf))
+        v = int.from_bytes(buf.raw[4:8], 'little') or 4096   # SYSTEM_INFO.dwPageSize
+        _win_page_size.v = v
+    return v
+
+def _win_mem_native():
+    """ntdll 原生路径：GlobalMemoryStatusEx 取物理内存总量，NQSI(2)/NQSI(21) 取可用页数与
+    系统缓存页数。三个量都与 GetPerformanceInfo 逐次精确一致，但绕开了 psapi 那一层
+    （实测该调用被第三方组件挂钩后单次 3~8ms，正常应约 0.05ms）。返回 (total_kb, used_kb)；
+    任一步失败返回 None。"""
+    global _win_mem_buf
+    nqsi = _win_nqsi()
+    ms = _win_mem_status()
+    if ms is None:
+        return None
+    if _win_mem_buf is None:
+        _win_mem_buf = ctypes.create_string_buffer(4096)
+    buf, ret = _win_mem_buf, wintypes.ULONG(0)
+    if nqsi(2, buf, len(buf), ctypes.byref(ret)) != 0:
+        return None
+    free_pages = int.from_bytes(buf.raw[_WIN_PERF_AVAIL_OFF:_WIN_PERF_AVAIL_OFF + 4], 'little')
+    if nqsi(21, buf, len(buf), ctypes.byref(ret)) != 0:
+        return None
+    cache_pages = int.from_bytes(buf.raw[_WIN_CACHE_SIZE_OFF:_WIN_CACHE_SIZE_OFF + 8], 'little')
+    page = _win_page_size()
+    total = ms.ullTotalPhys
+    return int(total/1024.0), int((total - free_pages * page - cache_pages * page)/1024.0)
+
+def _win_mem_no_cache():
+    """排除系统缓存的物理内存占用，返回 (total_kb, used_kb)；失败返回 None。
+
+    首选原生路径（约 0.005ms，比 GetPerformanceInfo 快约 700 倍）。原生结构偏移未文档化，
+    故首次调用与 GetPerformanceInfo 对账，偏差超过总量 1% 即永久退回后者，避免随系统版本漂移出错。"""
+    global _win_mem_native_ok
+    if _win_mem_native_ok is not False:
+        r = _win_mem_native()
+        if r is not None:
+            if _win_mem_native_ok is None:
+                g = _win_mem_gpi()
+                if g is None:
+                    _win_mem_native_ok = True
+                else:
+                    tol = max(65536, g[0] // 100)     # 64MB 或总量的 1%
+                    _win_mem_native_ok = abs(r[0] - g[0]) <= tol and abs(r[1] - g[1]) <= tol
+                    if not _win_mem_native_ok:
+                        return g
+            return r
+        _win_mem_native_ok = False
+    return _win_mem_gpi()
+
 def get_memory():
     if sys.platform.startswith("win"):
         r = _win_mem_no_cache()
@@ -143,6 +205,10 @@ def get_memory():
     return int(Mem.total / 1024.0), int(Mem.used / 1024.0)
 
 def get_swap():
+    if sys.platform.startswith("win"):
+        r = _win_swap()
+        if r is not None:
+            return r
     Mem = psutil.swap_memory()
     return int(Mem.total/1024.0), int(Mem.used/1024.0)
 
@@ -251,6 +317,8 @@ def get_cpu_model():
 # Linux:   /sys/class/net/<if>/device 软链接不存在 → 非物理（lo/docker0/veth/tun/br-）。
 _win_physical = None
 _win_cache_clock = 0.0
+_win_map_refreshing = False
+NIC_MAP_REFRESH_INTERVAL = 1800   # PNPDeviceID 映射重建间隔（秒）
 _WIN_NAME_HINTS = ('Loopback', 'Wi-Fi Direct', 'WAN Miniport', 'Bluetooth',
                    'Apple Mobile', 'Kernel Debug', 'TAP-', 'OpenVPN',
                    'Tailscale', 'WireGuard', 'VMware', 'VirtualBox',
@@ -261,7 +329,7 @@ def _win_is_physical(pnp_id):
     return bool(pnp_id) and pnp_id.startswith(('PCI\\', 'USB\\'))
 
 def _win_build_map():
-    """NetConnectionID → 是否物理。10 分钟缓存一次，避免每轮调 PowerShell"""
+    """NetConnectionID → 是否物理"""
     ps = ("[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
           "Get-CimInstance Win32_NetworkAdapter | "
           "Where-Object { $_.NetConnectionID } | "
@@ -274,25 +342,47 @@ def _win_build_map():
         items = [items]
     return {it['NetConnectionID']: _win_is_physical(it['PNPDeviceID']) for it in items}
 
+def _win_refresh_map():
+    """后台重建 PNPDeviceID 映射。PowerShell 单次要 1.5~2s，若放在 net 监控线程里同步做，
+    会把它整段堵住（期间不采样网卡计数），所以过期后异步刷新、期间继续用旧映射。"""
+    _name_current_thread('nic-map-refresh')
+    global _win_physical, _win_cache_clock, _win_map_refreshing
+    try:
+        mapping = _win_build_map()
+        if mapping:
+            _win_physical = mapping
+    except Exception:
+        pass
+    _win_cache_clock = time.time()   # 失败也推后重试，避免每轮都起 PowerShell
+    _win_map_refreshing = False
+
 def is_virtual_nic(name):
     """排除虚拟网卡和回环接口"""
     if sys.platform.startswith('win'):
-        global _win_physical, _win_cache_clock
+        global _win_physical, _win_cache_clock, _win_map_refreshing
         now = time.time()
-        if _win_physical is None or now - _win_cache_clock > 600:
+        if _win_physical is None:
+            # 首次必须同步建：没有映射就无法判断任何网卡（仅启动时一次）
             try:
                 _win_physical = _win_build_map()
-                _win_cache_clock = now
             except Exception:
-                _win_physical = _win_physical or {}   # 失败保留旧值，宁可多统计不崩
+                _win_physical = {}   # 失败时靠名字提示与 net_if_stats 兜底，宁可多统计不崩
+            _win_cache_clock = time.time()
+        elif now - _win_cache_clock > NIC_MAP_REFRESH_INTERVAL and not _win_map_refreshing:
+            _win_map_refreshing = True
+            threading.Thread(target=_win_refresh_map, daemon=True).start()
         if name in _win_physical:
             return not _win_physical[name]
         if any(h in name for h in _WIN_NAME_HINTS):
             return True
         try:
-            return psutil.net_if_stats()[name].speed == 0
+            virtual = psutil.net_if_stats()[name].speed == 0
         except Exception:
-            return False
+            virtual = False
+        # 记住兜底结果：net_if_stats 要枚举全部网卡（实测单个约 25ms），
+        # 而主循环每秒对每个网卡都调一次，不缓存会白白吃掉大量 CPU。
+        _win_physical[name] = not virtual
+        return virtual
     if name == 'lo':
         return True
     if not os.access('/sys/class/net', os.R_OK):
@@ -305,7 +395,8 @@ _net_lock = threading.Lock()
 
 def _sum_physical_counters(net):
     """按 is_virtual_nic 过滤后累加 (total_in, total_out)。
-    psutil pernic 值按 namedtuple 字段序，bytes_recv 下标 1、bytes_sent 下标 0。
+    入参值一律按 (bytes_sent, bytes_recv) 序，即 bytes_recv 下标 1、bytes_sent 下标 0——
+    psutil 的 namedtuple 与 _win_net_io_native 返回的元组都遵循这一顺序。
     抽成纯函数便于单测，不改变 _net_monitor 的单线程唯一调用设计。"""
     total_in = 0
     total_out = 0
@@ -316,13 +407,38 @@ def _sum_physical_counters(net):
         total_out += stats[0]
     return total_in, total_out
 
+def _psutil_net_io():
+    """psutil 网卡计数（兜底）。全文件唯一调用点——_net_monitor 是唯一读者，
+    并发读的隐患从根源上消除（护栏测试锁定这一点）。"""
+    return psutil.net_io_counters(pernic=True)
+
+_win_net_io_ok = None      # None 未自检 / True 原生可用 / False 永久退回 psutil
+
+def _net_io_counters():
+    """网卡计数入口。Windows 首选原生路径（GetIfTable2 + 适配器名集合筛选），键集与数值
+    与 psutil 逐次一致但便宜得多（实测 27.5ms → 1.07ms、7.3ms → 0.58ms）；原生不可用或
+    首次对账不通过则退回 psutil。"""
+    global _win_net_io_ok
+    if sys.platform.startswith("win"):
+        if _win_net_io_ok is None:
+            native = _win_net_io_selfcheck()
+            _win_net_io_ok = native is not None
+            if native is not None:
+                return native
+        elif _win_net_io_ok:
+            native = _win_net_io_native()
+            if native is not None:
+                return native
+            _win_net_io_ok = False
+    return _psutil_net_io()
+
 def _net_monitor():
     """独立线程：唯一读取网卡计数的地方，读累计值存全局并算网速"""
     _name_current_thread('net-monitor')
     global _net_in, _net_out
     while True:
         try:
-            total_in, total_out = _sum_physical_counters(psutil.net_io_counters(pernic=True))
+            total_in, total_out = _sum_physical_counters(_net_io_counters())
             with _net_lock:
                 _net_in = total_in
                 _net_out = total_out
@@ -525,70 +641,263 @@ def _win_load_step(qlen):
             _win_load_averages[:] = [float(instant)] * 3
     _win_load_prev_clock = now
 
+class _MEMORYSTATUSEX(ctypes.Structure):
+    _fields_ = [
+        ("dwLength", wintypes.DWORD),
+        ("dwMemoryLoad", wintypes.DWORD),
+        ("ullTotalPhys", ctypes.c_ulonglong),
+        ("ullAvailPhys", ctypes.c_ulonglong),
+        ("ullTotalPageFile", ctypes.c_ulonglong),
+        ("ullAvailPageFile", ctypes.c_ulonglong),
+        ("ullTotalVirtual", ctypes.c_ulonglong),
+        ("ullAvailVirtual", ctypes.c_ulonglong),
+        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+    ]
 
-def _win_pdh_queue_length():
-    """当前就绪队列线程数；PDH 数据未就绪/失败返回 None"""
-    if _pdh is None:
-        return None
-    pdh, query, counter = _pdh, _pdh_query, _pdh_counter
-    if pdh.PdhCollectQueryData(query) != 0:
-        return None
-    value = _PDH_FMT_COUNTERVALUE()
-    ctype = wintypes.DWORD(0)
-    # 0x400 = PDH_FMT_LARGE：union 按 8 字节 LARGE_INTEGER 读，与结构布局一致
-    if pdh.PdhGetFormattedCounterValue(counter, 0x400, ctypes.byref(ctype), ctypes.byref(value)) != 0:
-        return None
-    if value.CStatus not in (0, 1):   # PDH_CSTATUS_VALID_DATA / NEW_DATA，其余为无效/待更新
-        return None
-    return max(0, value.value)
+class _PDH_FMT_DOUBLE(ctypes.Structure):
+    _fields_ = [('CStatus', wintypes.LONG), ('value', ctypes.c_double)]
 
-def _win_load_thread():
-    """独立线程：每 5s 采一次瞬时负载，做 1/5/15 分钟 EWMA，主循环只读快照。
-    瞬时负载 = 就绪队列线程数 + Σ(每核 CPU 利用率)（连续值，与 Linux 语义一致：
-    单核跑满记 1、利用率 60% 记 0.6，避免离散阈值在中等负载区间低估）。
-    启动后 2 分钟为 warm-up：直接报瞬时值，避免 PDH 数据未就绪/无基线时
-    把起点钉在 0，导致监控读数从 0 缓慢爬升。"""
-    tau = (60.0, 300.0, 900.0)
-    prev_idle = None
-    prev_clock = 0.0
-    warm_until = time.time() + 120
-    _win_pdh_init()   # PDH 不可用时就绪队列恒 0，负载退化为 Σ利用率
-    while True:
+_swap_pdh = None
+_swap_pdh_query = None
+_swap_pdh_counter = None
+
+def _win_mem_status():
+    """GlobalMemoryStatusEx，惰性绑定并复用缓冲区；失败返回 None"""
+    fn = getattr(_win_mem_status, 'fn', None)
+    if fn is None:
+        fn = ctypes.windll.kernel32.GlobalMemoryStatusEx
+        fn.argtypes = [ctypes.POINTER(_MEMORYSTATUSEX)]
+        fn.restype = wintypes.BOOL
+        buf = _MEMORYSTATUSEX()
+        buf.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+        _win_mem_status.fn = fn
+        _win_mem_status.buf = buf
+    if not fn(ctypes.byref(_win_mem_status.buf)):
+        return None
+    return _win_mem_status.buf
+
+def _win_swap_percent():
+    """页面文件占用率（%）。PDH 查询惰性打开后常驻：psutil 每次调用都重开查询并重新解析
+    计数器路径，首次可达数百毫秒；常驻后单次约 0.03ms。失败返回 None。"""
+    global _swap_pdh, _swap_pdh_query, _swap_pdh_counter
+    if _swap_pdh is None:
         try:
-            qlen = _win_pdh_queue_length()
-            perfs = _win_perf_snapshot()
-            if perfs is not None or qlen is not None:
-                running = 0.0
-                if perfs is not None and prev_idle is not None:
-                    for cur, prev in zip(perfs, prev_idle):
-                        # 注意：KernelTime 包含 IdleTime，必须先减掉再算内核忙碌时间
-                        idle = cur.IdleTime - prev.IdleTime
-                        busy = (cur.KernelTime - prev.KernelTime) - idle + (cur.UserTime - prev.UserTime)
-                        total = busy + idle
-                        if total > 0:
-                            running += busy / total
-                if perfs is not None:
-                    prev_idle = perfs
-                instant = (qlen or 0) + running
-                now = time.time()
-                if now < warm_until:
-                    with _win_load_lock:
-                        _win_load_averages[:] = [float(instant)] * 3
-                elif prev_clock > 0:
-                    dt = now - prev_clock
-                    avg = list(_win_load_averages)
-                    for i, t in enumerate(tau):
-                        f = math.exp(-dt / t)
-                        avg[i] = avg[i] * f + instant * (1.0 - f)
-                    with _win_load_lock:
-                        _win_load_averages[:] = avg
-                else:
-                    with _win_load_lock:
-                        _win_load_averages[:] = [float(instant)] * 3
-                prev_clock = now
+            pdh = ctypes.WinDLL('pdh')
+            pdh.PdhOpenQueryW.argtypes = [wintypes.LPCWSTR, ctypes.c_size_t, ctypes.POINTER(wintypes.HANDLE)]
+            pdh.PdhOpenQueryW.restype = wintypes.LONG
+            pdh.PdhAddEnglishCounterW.argtypes = [wintypes.HANDLE, wintypes.LPCWSTR, ctypes.c_size_t, ctypes.POINTER(wintypes.HANDLE)]
+            pdh.PdhAddEnglishCounterW.restype = wintypes.LONG
+            pdh.PdhCollectQueryData.argtypes = [wintypes.HANDLE]
+            pdh.PdhCollectQueryData.restype = wintypes.LONG
+            pdh.PdhGetFormattedCounterValue.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                                        ctypes.POINTER(wintypes.DWORD),
+                                                        ctypes.POINTER(_PDH_FMT_DOUBLE)]
+            pdh.PdhGetFormattedCounterValue.restype = wintypes.LONG
+            query = wintypes.HANDLE()
+            counter = wintypes.HANDLE()
+            if pdh.PdhOpenQueryW(None, 0, ctypes.byref(query)) != 0:
+                return None
+            if pdh.PdhAddEnglishCounterW(query, "\\Paging File(_Total)\\% Usage", 0, ctypes.byref(counter)) != 0:
+                return None
+            pdh.PdhCollectQueryData(query)
+            _swap_pdh, _swap_pdh_query, _swap_pdh_counter = pdh, query, counter
         except Exception:
-            pass
-        time.sleep(5)
+            return None
+    try:
+        if _swap_pdh.PdhCollectQueryData(_swap_pdh_query) != 0:
+            return None
+        value = _PDH_FMT_DOUBLE()
+        ctype = wintypes.DWORD(0)
+        # 0x200 = PDH_FMT_DOUBLE
+        if _swap_pdh.PdhGetFormattedCounterValue(_swap_pdh_counter, 0x200, ctypes.byref(ctype), ctypes.byref(value)) != 0:
+            return None
+        if value.CStatus not in (0, 1):
+            return None
+        return value.value
+    except Exception:
+        return None
+
+def _win_swap():
+    """Windows swap，与 psutil.swap_memory() 同源同值：total 取页面文件总量
+    （GlobalMemoryStatusEx），used = 占用率 × total。实测与 psutil 逐位一致，
+    单次约 0.03ms（psutil 约 3.9ms，首次可达数百毫秒）。失败返回 None。"""
+    ms = _win_mem_status()
+    if ms is None:
+        return None
+    total = ms.ullTotalPageFile - ms.ullTotalPhys
+    if total <= 0:
+        return 0, 0
+    percent = _win_swap_percent()
+    if percent is None:
+        return None
+    return int(total / 1024.0), int(0.01 * percent * total / 1024.0)
+
+# MIB_IF_ROW2（x64）字段偏移：行距 1352，表头 8 字节。标定方式为扫描缓冲里的宽字符串定行距、
+# 再用 psutil 的值反解字段；两台真机（13 / 6 个网卡）逐网卡零差异。
+_WIN_IF_ROW_SIZE = 1352
+_WIN_IF_ALIAS_OFF = 28
+_WIN_IF_IN_OFF = 1208
+_WIN_IF_OUT_OFF = 1280
+
+# GetAdaptersAddresses 标志：SKIP_ANYCAST | SKIP_MULTICAST | SKIP_DNS_SERVER。
+# 不能带 INCLUDE_ALL_INTERFACES——那会把 WFP / Npcap / QoS / VirtualBox 等**过滤层接口**
+# 也列出来，它们的计数与父网卡完全相同（同一批包被记多遍），全加会让上报流量翻数倍。
+_WIN_GAA_FLAGS = 0x02 | 0x04 | 0x08
+
+NET_NAMES_REFRESH_INTERVAL = 1800      # 适配器名集合刷新间隔（秒）
+
+_win_gaa = None
+_win_net_names = None
+_win_net_names_clock = 0.0
+
+def _win_wstr_at(raw, off, maxchars=257):
+    """从字节串里解定长 UTF-16LE 字符串（遇 NUL 截断）"""
+    end = off
+    for k in range(maxchars):
+        if raw[off + 2 * k] == 0 and raw[off + 2 * k + 1] == 0:
+            break
+        end = off + 2 * k + 2
+    return raw[off:end].decode('utf-16le', 'replace')
+
+def _win_gaa_names():
+    """GetAdaptersAddresses 的 FriendlyName 集合。该集合与 psutil.net_io_counters 的键集
+    实测逐次完全一致（13 / 6 个网卡零差异），是判断"哪些网卡该计入"的正确来源——
+    光看 GetIfTable2 的 FilterInterface 标志不够（未连接的物理网卡、隧道、Wi-Fi Direct
+    也要排除）。失败返回 None。"""
+    global _win_gaa
+    try:
+        if _win_gaa is None:
+            fn = ctypes.WinDLL('iphlpapi').GetAdaptersAddresses
+            fn.argtypes = [wintypes.ULONG, wintypes.ULONG, ctypes.c_void_p,
+                           ctypes.c_void_p, ctypes.POINTER(wintypes.ULONG)]
+            fn.restype = wintypes.ULONG
+            _win_gaa = fn
+        size = wintypes.ULONG(15000)
+        buf = ctypes.create_string_buffer(size.value)
+        rc = _win_gaa(0, _WIN_GAA_FLAGS, None, buf, ctypes.byref(size))   # 0 = AF_UNSPEC
+        if rc == 111:                                                     # ERROR_BUFFER_OVERFLOW
+            buf = ctypes.create_string_buffer(size.value)
+            rc = _win_gaa(0, _WIN_GAA_FLAGS, None, buf, ctypes.byref(size))
+        if rc != 0:
+            return None
+        names = set()
+        addr = ctypes.addressof(buf)
+        while addr:
+            ptr = int.from_bytes(ctypes.string_at(addr + 72, 8), 'little')   # FriendlyName
+            if ptr:
+                names.add(ctypes.wstring_at(ptr))
+            addr = int.from_bytes(ctypes.string_at(addr + 8, 8), 'little')   # Next
+        return names
+    except Exception:
+        return None
+
+def _win_net_names_get():
+    """适配器名集合，带 TTL。集合变化很慢，刷新一次只要几毫秒，同步做即可。"""
+    global _win_net_names, _win_net_names_clock
+    now = time.time()
+    if _win_net_names is None or now - _win_net_names_clock >= NET_NAMES_REFRESH_INTERVAL:
+        names = _win_gaa_names()
+        if names:
+            _win_net_names = names
+            _win_net_names_clock = now
+    return _win_net_names
+
+def _win_if_table2():
+    """GetIfTable2 → [(alias, InOctets, OutOctets)]；只取需要的三个字段随即释放表。
+    失败返回 None。"""
+    try:
+        fn = getattr(_win_if_table2, 'fn', None)
+        if fn is None:
+            iphlp = ctypes.WinDLL('iphlpapi')
+            fn = iphlp.GetIfTable2
+            fn.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+            fn.restype = wintypes.ULONG
+            free = iphlp.FreeMibTable
+            free.argtypes = [ctypes.c_void_p]
+            _win_if_table2.fn = fn
+            _win_if_table2.free = free
+        ptr = ctypes.c_void_p()
+        if fn(ctypes.byref(ptr)) != 0 or not ptr.value:
+            return None
+        try:
+            n = int.from_bytes(ctypes.string_at(ptr.value, 4), 'little')     # NumEntries
+            if not 0 < n < 4096:
+                return None
+            raw = ctypes.string_at(ptr.value, 8 + n * _WIN_IF_ROW_SIZE)
+        finally:
+            _win_if_table2.free(ptr)
+        rows = []
+        for i in range(n):
+            b = 8 + i * _WIN_IF_ROW_SIZE
+            alias = _win_wstr_at(raw, b + _WIN_IF_ALIAS_OFF)
+            if not alias:
+                continue
+            rows.append((alias,
+                         int.from_bytes(raw[b + _WIN_IF_IN_OFF:b + _WIN_IF_IN_OFF + 8], 'little'),
+                         int.from_bytes(raw[b + _WIN_IF_OUT_OFF:b + _WIN_IF_OUT_OFF + 8], 'little')))
+        return rows
+    except Exception:
+        return None
+
+def _win_net_io_native():
+    """原生网卡计数：GetIfTable2 一次调用，按适配器名集合筛选，返回
+    {name: (bytes_sent, bytes_recv)}——与 psutil 的 pernic 计数同键集、同字段序
+    （可直接喂给 _sum_physical_counters）。失败返回 None。"""
+    rows = _win_if_table2()
+    if rows is None:
+        return None
+    names = _win_net_names_get()
+    if not names:
+        return None
+    return {alias: (vout, vin) for alias, vin, vout in rows if alias in names}
+
+def _win_net_io_selfcheck():
+    """首次对账：适配器名集合必须与 psutil 完全相同，且总量被前后两次原生读数夹住
+    （避免读取时差造成误判）。任一不满足即永久退回 psutil——这些结构偏移未文档化，
+    宁可退回慢路径也不能报错数。通过则返回本次原生读数。"""
+    n1 = _win_net_io_native()
+    if n1 is None:
+        return None
+    ps = _psutil_net_io()
+    n2 = _win_net_io_native()
+    if n2 is None or set(n1) != set(ps):
+        return None
+    for i in (0, 1):        # 0=bytes_sent, 1=bytes_recv
+        lo = sum(v[i] for v in n1.values())
+        hi = sum(v[i] for v in n2.values())
+        cur = sum(v[i] for v in ps.values())
+        if not lo <= cur <= hi + (1 << 20):
+            return None
+    return n2
+
+_win_tcp_table = None
+
+def _win_tcp_conn_count():
+    """Windows TCP 连接数：直接读 GetExtendedTcpTable 返回表的 dwNumEntries，只为计数，
+    不构造每条连接对象——下载类机器上万连接时 psutil.net_connections 可达 70ms+。
+    实测（含 IPv4+IPv6）与 psutil.net_connections('tcp') 计数一致。失败返回 None。"""
+    global _win_tcp_table
+    try:
+        if _win_tcp_table is None:
+            fn = ctypes.WinDLL('iphlpapi').GetExtendedTcpTable
+            fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD), wintypes.BOOL,
+                           wintypes.DWORD, ctypes.c_int, wintypes.DWORD]
+            fn.restype = wintypes.DWORD
+            _win_tcp_table = fn
+        total = 0
+        for af in (2, 23):                        # AF_INET / AF_INET6
+            for _ in range(3):                    # 表在两次调用间可能增长，失败重取
+                size = wintypes.DWORD(0)
+                _win_tcp_table(None, ctypes.byref(size), False, af, 5, 0)   # 5 = TCP_TABLE_OWNER_PID_ALL
+                if size.value == 0:
+                    break
+                buf = ctypes.create_string_buffer(size.value)
+                if _win_tcp_table(buf, ctypes.byref(size), False, af, 5, 0) == 0:
+                    total += int.from_bytes(buf.raw[:4], 'little')          # dwNumEntries
+                    break
+        return total
+    except Exception:
+        return None
 
 def tupd():
     '''
@@ -614,13 +923,16 @@ def tupd():
 
         elif sys.platform.startswith("win") is True:
             # Windows：走原生 API（与任务管理器同源），避免 netstat 管道 + 逐进程遍历（约 7s）
-            t = 0
-            u = 0
+            t = _win_tcp_conn_count()                         # GetExtendedTcpTable，只读计数
+            if t is None:
+                try:
+                    t = len(psutil.net_connections(kind='tcp'))
+                except Exception:
+                    t = 0
             try:
-                t = len(psutil.net_connections(kind='tcp'))   # GetExtendedTcpTable
-                u = len(psutil.net_connections(kind='udp'))   # GetExtendedUdpTable
+                # UDP 表原生口径与 psutil 不一致（实测 37 vs 47），且开销极小，保留 psutil
+                u = len(psutil.net_connections(kind='udp'))
             except Exception:
-                t = 0
                 u = 0
             p, d, _ = _win_sys_counts()                       # NtQuerySystemInformation
         else:

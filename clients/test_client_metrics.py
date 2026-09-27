@@ -313,6 +313,301 @@ veth123: 8000 8 0 0 0 0 0 0 8000 8 0 0 0 0 0 0
                 self.assertEqual(resolve_calls, ["cu.tz.cloudcpp.com"])
                 self.assertEqual(connect_targets, [("10.0.0.9", 80)] * stop_after)
 
+    # --- 客户端 CPU 占用优化 ----------------------------------------------
+
+    def test_monitor_thread_resolves_once_then_reuses_ip(self):
+        """端到端：_monitor_thread 多轮内只解析一次，且复用同一 IP 建连。"""
+        client = load_client("client-psutil.py")
+        resolve_calls = []
+        connect_targets = []
+        stop_after = 5
+        client_globals = client["_monitor_thread"].__globals__
+        real_socket = client_globals["socket"]
+
+        def fake_getaddrinfo(host, port, family):
+            resolve_calls.append(host)
+            return [(family, None, None, None, ("10.0.0.9", 0))]
+
+        def fake_create_connection(target, timeout=None):
+            connect_targets.append(target)
+            if len(connect_targets) >= stop_after:
+                raise SystemExit  # 退出无限循环
+            return mock.MagicMock()
+
+        client_globals["monitorServer"]["m1"] = {"type": "tcp", "host": "example.com:80", "latency": 0}
+        try:
+            with mock.patch.object(real_socket, "getaddrinfo", fake_getaddrinfo), \
+                    mock.patch.object(real_socket, "create_connection", fake_create_connection), \
+                    mock.patch.dict(client_globals, {"DNS_REFRESH_INTERVAL": 30}):
+                client["_monitor_thread"]("m1", "example.com:80", 0.001, "tcp")
+        except SystemExit:
+            pass
+
+        self.assertEqual(len(connect_targets), stop_after)
+        self.assertEqual(resolve_calls, ["example.com"])
+        self.assertEqual(connect_targets, [("10.0.0.9", 80)] * stop_after)
+
+    def test_constant_metrics_are_cached(self):
+        """get_uptime/get_os_name 的常量值进程内只取一次，避免每轮重复系统调用/文件读取。"""
+        client = load_client("client-psutil.py")
+        boot_calls = []
+        with mock.patch.object(client["psutil"], "boot_time",
+                               side_effect=lambda: boot_calls.append(1) or 1000.0):
+            client["get_uptime"]()
+            client["get_uptime"]()
+        self.assertEqual(len(boot_calls), 1)
+
+        with mock.patch.object(client["platform"], "system", return_value="Linux"), \
+                mock.patch("builtins.open", mock.mock_open(read_data='ID=alpine\n')) as open_mock:
+            self.assertEqual(client["get_os_name"](), "alpine")
+            self.assertEqual(client["get_os_name"](), "alpine")
+        self.assertEqual(open_mock.call_count, 1)
+
+    def test_tupd_sampling_moved_out_of_main_loop(self):
+        """tupd 采样移到后台线程：主循环只读 _tupd_snapshot，避免每轮 fork 子进程；
+        _disk_io 的进程级遍历结果无人读取，不得回归。"""
+        source = (CLIENT_DIR / "client-psutil.py").read_text(encoding="utf-8")
+        self.assertIn("target=_tupd_thread", source)
+        self.assertIn("array['tcp'], array['udp'], array['process'], array['thread'] = _tupd_snapshot", source)
+        self.assertNotIn("psutil.process_iter()", source)
+        self.assertEqual(load_client("client-psutil.py")["TUP_INTERVAL"], 3)
+
+    # --- Windows 专项优化 -------------------------------------------------
+
+    def test_windows_virtual_nic_fallback_is_cached(self):
+        """兜底判定（net_if_stats）结果必须写回映射表：主循环每秒对每个网卡都调一次，
+        不缓存会每秒重复枚举全部网卡（实测单次约 25ms）。"""
+        client = load_client("client-psutil.py")
+        client_globals = client["is_virtual_nic"].__globals__
+        stats_calls = []
+
+        def fake_stats():
+            stats_calls.append(1)
+            return {"奇怪网卡": types.SimpleNamespace(speed=0)}
+
+        with mock.patch.object(client["sys"], "platform", "win"), \
+                mock.patch.object(client["psutil"], "net_if_stats", side_effect=fake_stats), \
+                mock.patch.dict(client_globals, {"_win_physical": {}, "_win_cache_clock": time.time(),
+                                                 "_win_build_map": lambda: {}}):
+            results = [client["is_virtual_nic"]("奇怪网卡") for _ in range(5)]
+
+        self.assertEqual(results, [True] * 5)
+        self.assertEqual(len(stats_calls), 1)
+
+    def test_windows_nic_map_refresh_is_async(self):
+        """映射过期后必须异步重建：PowerShell 单次 1.5~2s，同步做会把 net 监控线程
+        整段堵住（期间不采样网卡计数）。"""
+        client = load_client("client-psutil.py")
+        client_globals = client["is_virtual_nic"].__globals__
+        started = threading.Event()
+
+        def slow_build():
+            started.set()
+            time.sleep(0.3)
+            return {"网卡A": True}
+
+        with mock.patch.object(client["sys"], "platform", "win"), \
+                mock.patch.dict(client_globals, {"_win_physical": {"网卡A": True},
+                                                 "_win_cache_clock": 0.0,
+                                                 "_win_map_refreshing": False,
+                                                 "_win_build_map": slow_build,
+                                                 "NIC_MAP_REFRESH_INTERVAL": 1}):
+            begin = time.perf_counter()
+            result = client["is_virtual_nic"]("网卡A")
+            elapsed = time.perf_counter() - begin
+            # 必须趁 mock 生效期间等：撤销后后台线程会走到真的 _win_build_map（PowerShell 1.5~2s）
+            rebuilt = started.wait(2)
+
+        self.assertFalse(result)          # 立即用旧映射给出结果
+        self.assertLess(elapsed, 0.1)     # 没有被 0.3s 的重建阻塞
+        self.assertTrue(rebuilt)          # 后台确实在重建
+
+    def test_windows_swap_uses_native_path(self):
+        """Windows 的 get_swap 必须走 _win_swap（GlobalMemoryStatusEx + 常驻 PDH），
+        而非 psutil.swap_memory——后者每次重开 PDH 查询并重新解析计数器路径，
+        实测稳态 3.9ms、首次可达数百毫秒。"""
+        source = (CLIENT_DIR / "client-psutil.py").read_text(encoding="utf-8")
+        self.assertIn("r = _win_swap()", source)
+        self.assertIn("Paging File(_Total)", source)
+        self.assertIn("GlobalMemoryStatusEx", source)
+        if sys.platform.startswith("win"):
+            total, used = load_client("client-psutil.py")["get_swap"]()
+            self.assertIsInstance(total, int)
+            self.assertIsInstance(used, int)
+            self.assertGreaterEqual(total, 0)
+            self.assertGreaterEqual(used, 0)
+
+    def test_windows_memory_uses_native_path(self):
+        """Windows 的 get_memory 首选 ntdll 原生路径：GetPerformanceInfo 实测约 1.2ms
+        （正常应约 0.05ms，慢在 psapi 那一层），原生等价路径约 0.005ms。三个量取自
+        GlobalMemoryStatusEx + NtQuerySystemInformation(2/21)，偏移未文档化，故首次调用
+        必须与 GetPerformanceInfo 对账后才启用。"""
+        source = (CLIENT_DIR / "client-psutil.py").read_text(encoding="utf-8")
+        self.assertIn("r = _win_mem_no_cache()", source)
+        self.assertIn("_win_mem_gpi()", source)
+        self.assertIn("_win_mem_native_ok", source)
+        self.assertIn("_WIN_PERF_AVAIL_OFF = 0x2C", source)   # 布局护栏
+        self.assertIn("_WIN_CACHE_SIZE_OFF = 0x28", source)
+        if sys.platform.startswith("win"):
+            client = load_client("client-psutil.py")
+            # runpy.run_path 返回 globals 的拷贝，函数写回的是原始 dict，须经 __globals__ 读
+            g = client["_win_mem_no_cache"].__globals__
+            total, used = client["get_memory"]()
+            self.assertIsInstance(total, int)
+            self.assertIsInstance(used, int)
+            self.assertGreater(total, 0)
+            self.assertGreaterEqual(used, 0)
+            self.assertLessEqual(used, total)
+            self.assertTrue(g["_win_mem_native_ok"])          # 对账通过 → 走原生路径
+            native = client["_win_mem_native"]()
+            gpi = client["_win_mem_gpi"]()
+            self.assertIsNotNone(native)
+            self.assertIsNotNone(gpi)
+            # 两路相邻读取之间内存会小幅抖动，容差与自检一致（64MB 或总量的 1%）
+            self.assertLess(abs(native[1] - gpi[1]), max(65536, gpi[0] // 100))
+
+    def test_windows_memory_falls_back_when_layout_drifts(self):
+        """原生结构偏移未文档化：首次对账不通过时必须永久退回 GetPerformanceInfo，
+        且不再重复走原生（否则每秒白付一次对账成本）。"""
+        client = load_client("client-psutil.py")
+        g = client["_win_mem_no_cache"].__globals__
+        native_calls = []
+
+        with mock.patch.dict(g, {"_win_mem_native": lambda: native_calls.append(1) or (100, 999999),
+                                 "_win_mem_gpi": lambda: (100, 50),
+                                 "_win_mem_native_ok": None}):
+            first = client["_win_mem_no_cache"]()
+            ok_after_first = g["_win_mem_native_ok"]
+            client["_win_mem_no_cache"]()
+            client["_win_mem_no_cache"]()
+            ok_after_third = g["_win_mem_native_ok"]
+
+        self.assertEqual(first, (100, 50))        # 退回到 GPI 的值
+        self.assertFalse(ok_after_first)
+        self.assertFalse(ok_after_third)
+        self.assertEqual(len(native_calls), 1)    # 只对账一次，之后不再碰原生
+
+    def test_windows_net_io_uses_native_path(self):
+        """Windows 的网卡计数走原生路径：GetIfTable2 一次调用 + GetAdaptersAddresses 适配器名
+        集合筛选。筛选是必须的——GetIfTable2 会列出 WFP/Npcap/QoS/VirtualBox 等**过滤层接口**，
+        它们的计数与父网卡完全相同（同一批包被记多遍），全加会让上报流量翻数倍。
+        实测 27.5ms → 1.07ms（13 网卡机）/ 7.3ms → 0.58ms（6 网卡机）。"""
+        source = (CLIENT_DIR / "client-psutil.py").read_text(encoding="utf-8")
+        self.assertIn("_win_net_io_native()", source)
+        self.assertIn("GetIfTable2", source)
+        self.assertIn("GetAdaptersAddresses", source)
+        self.assertIn("_WIN_IF_ROW_SIZE = 1352", source)          # 布局护栏
+        self.assertIn("_WIN_IF_IN_OFF = 1208", source)
+        self.assertIn("_WIN_IF_OUT_OFF = 1280", source)
+        self.assertIn("_WIN_GAA_FLAGS = 0x02 | 0x04 | 0x08", source)   # 不能带 INCLUDE_ALL_INTERFACES
+        if sys.platform.startswith("win"):
+            client = load_client("client-psutil.py")
+            g = client["_net_io_counters"].__globals__
+            native = client["_net_io_counters"]()
+            self.assertTrue(g["_win_net_io_ok"])                  # 对账通过 → 走原生
+            ps = client["_psutil_net_io"]()
+            self.assertEqual(set(native), set(ps))                # 键集必须与 psutil 完全一致
+            # 数值逐网卡一致（两次读取之间计数会前进，留 1% 余量）
+            for name, stats in ps.items():
+                for i in (0, 1):
+                    self.assertLess(abs(native[name][i] - stats[i]),
+                                    max(2000000, stats[i] // 100))
+
+    def test_windows_net_io_falls_back_when_names_differ(self):
+        """适配器名集合与 psutil 不符时必须永久退回 psutil——集合错了会把过滤层接口也算进去，
+        上报流量直接翻倍。这是本项改动唯一会"算错数"的风险点。"""
+        client = load_client("client-psutil.py")
+        g = client["_net_io_counters"].__globals__
+        if not sys.platform.startswith("win"):
+            return
+        with mock.patch.dict(g, {"_win_net_io_native": lambda: {"假网卡": (1, 2)},
+                                 "_win_net_io_ok": None}):
+            first = client["_net_io_counters"]()
+            ok_after_first = g["_win_net_io_ok"]
+            again = client["_net_io_counters"]()
+            ok_after_second = g["_win_net_io_ok"]
+        self.assertFalse(ok_after_first)
+        self.assertFalse(ok_after_second)
+        self.assertEqual(set(first), set(client["_psutil_net_io"]()))   # 退回 psutil 的值
+        self.assertEqual(set(again), set(first))
+
+    def test_windows_tcp_count_uses_native_table(self):
+        """TCP 计数走 GetExtendedTcpTable 只读 dwNumEntries，避免 psutil 为每条连接
+        构造对象（下载类机器上万连接时可达 70ms+）。"""
+        source = (CLIENT_DIR / "client-psutil.py").read_text(encoding="utf-8")
+        self.assertIn("_win_tcp_conn_count()", source)
+        self.assertIn("GetExtendedTcpTable", source)
+        if sys.platform.startswith("win"):
+            client = load_client("client-psutil.py")
+            native = client["_win_tcp_conn_count"]()
+            self.assertIsNotNone(native)
+            self.assertGreaterEqual(native, 0)
+            # 连接表是活的，两次读取之间可能有极小抖动
+            psutil_count = len(client["psutil"].net_connections(kind='tcp'))
+            self.assertLessEqual(abs(native - psutil_count), 5)
+
+    def test_windows_load_shares_tupd_snapshot(self):
+        """就绪队列长度搭 tupd 那次原生快照的车，不再单独走 PDH 的 System provider
+        （单次 4~9ms，是 Paging File provider 的两个数量级）。就绪队列 = ThreadState==Ready
+        的线程数（实测与 PDH \\System\\Processor Queue Length 对齐：施压时 40.01 vs 39.86、
+        min/max 一致），状态值只占低字节，按结构步长切片计数（纯 C 层，比逐线程解包快 3 倍）。"""
+        source = (CLIENT_DIR / "client-psutil.py").read_text(encoding="utf-8")
+        self.assertNotIn("_win_load_thread", source)
+        self.assertNotIn("_win_pdh_queue_length", source)
+        self.assertIn("_win_load_step(_win_ready_last)", source)
+        if sys.platform.startswith("win"):
+            client = load_client("client-psutil.py")
+            # runpy.run_path 返回 globals 的拷贝，函数写回的是原始 dict，须经 __globals__ 读
+            g = client["_win_sys_counts"].__globals__
+            procs, threads, ready = client["_win_sys_counts"]()
+            self.assertGreater(procs, 0)
+            self.assertGreater(threads, 0)
+            self.assertGreaterEqual(ready, 0)
+            self.assertEqual(g["_win_ready_last"], ready)
+
+            # 与 psutil 对账线程总数：两次快照之间有进程起落，留 2% 余量
+            ps_threads = sum(p.num_threads() for p in client["psutil"].process_iter())
+            self.assertLess(abs(threads - ps_threads), max(10, int(ps_threads * 0.02)))
+
+            # 切片计数必须与逐线程解包在同一份缓冲上逐条对齐（偏移写死，兼作布局护栏）
+            b = g["_win_sys_buf"]
+            ref = 0
+            off = 0
+            while off < len(b):
+                nxt = int.from_bytes(b[off:off + 4], "little")
+                nthr = int.from_bytes(b[off + 4:off + 8], "little")
+                limit = max(0, (len(b) - off - 0x100) // 80)
+                for i in range(min(nthr, limit)):
+                    p = off + 0x100 + i * 80 + 68
+                    if int.from_bytes(b[p:p + 4], "little") == 1:
+                        ref += 1
+                if nxt == 0:
+                    break
+                off += nxt
+            self.assertEqual(ready, ref)
+
+    def test_all_client_threads_are_named(self):
+        """每个线程函数入口都要调 _name_current_thread；且它必须同时写 Python 名与
+        Windows 原生线程描述——Python 的 Thread(name=) 不写原生描述，Process Explorer
+        与按 tid 查名的诊断脚本会看不到。"""
+        client = load_client("client-psutil.py")
+        source = (CLIENT_DIR / "client-psutil.py").read_text(encoding="utf-8")
+        for marker in ("'net-monitor'", "'net-probe'", "'tupd'",
+                       "'disk-io'", "'nic-map-refresh'", "'ping-'", "'monitor-'"):
+            self.assertIn("_name_current_thread(" + marker, source, marker)
+
+        client["_name_current_thread"]("unit-named-thread")
+        self.assertEqual(threading.current_thread().name, "unit-named-thread")
+        if sys.platform.startswith("win"):
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.windll.kernel32
+            k32.GetThreadDescription.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_wchar_p)]
+            k32.GetThreadDescription.restype = ctypes.c_long
+            buf = ctypes.c_wchar_p()
+            k32.GetThreadDescription(k32.GetCurrentThread(), ctypes.byref(buf))
+            self.assertEqual(buf.value, "unit-named-thread")
+
 
 if __name__ == "__main__":
     unittest.main()
