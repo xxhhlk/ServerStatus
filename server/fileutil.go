@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"syscall"
 	"time"
@@ -151,7 +152,14 @@ func pruneBackups(configPath string, keep int) {
 	}
 }
 
+// syncDirectory flushes the parent directory so the rename survives a crash.
+// Windows cannot fsync a directory handle (FlushFileBuffers reports
+// ERROR_ACCESS_DENIED) and NTFS journals metadata itself, so it is a no-op
+// there instead of failing every config write.
 func syncDirectory(directory string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
 	dir, err := os.Open(directory)
 	if err != nil {
 		return err
