@@ -9,6 +9,7 @@ import (
 	"mime"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -368,7 +369,9 @@ func (a *App) staticHandler(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"ok": false, "error": "endpoint was not found"})
 		return
 	}
-	requestPath := filepath.Clean("/" + c.Request.URL.Path)
+	// URL paths always use "/", so clean them with path. filepath.Clean would
+	// rewrite separators to "\" on Windows and break the root check below.
+	requestPath := path.Clean("/" + c.Request.URL.Path)
 	if requestPath == "/" {
 		requestPath = "/index.html"
 	}
@@ -377,7 +380,7 @@ func (a *App) staticHandler(c *gin.Context) {
 		c.Status(http.StatusInternalServerError)
 		return
 	}
-	filePath := filepath.Join(root, strings.TrimPrefix(requestPath, "/"))
+	filePath := filepath.Join(root, filepath.FromSlash(strings.TrimPrefix(requestPath, "/")))
 	if filePath != root && !strings.HasPrefix(filePath, root+string(os.PathSeparator)) {
 		c.Status(http.StatusNotFound)
 		return
