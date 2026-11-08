@@ -148,6 +148,8 @@ type WatchdogEnvironment struct {
 	SwapUsed       float64 `expr:"swap_used"`
 	HDDTotal       float64 `expr:"hdd_total"`
 	HDDUsed        float64 `expr:"hdd_used"`
+	HDDMaxPct      float64 `expr:"hdd_max_pct"`
+	HDDMaxMount    string  `expr:"hdd_max_mount"`
 	IORead         float64 `expr:"io_read"`
 	IOWrite        float64 `expr:"io_write"`
 	CPU            float64 `expr:"cpu"`
@@ -162,6 +164,7 @@ func watchdogEnvironment(config ServerConfig, stats AgentStats, online4, online6
 		}
 		return 0
 	}
+	maxPct, maxMount := hddMaxUsage(stats)
 	return WatchdogEnvironment{
 		Username: config.Username, Name: config.Name, NodeType: config.Type, Host: config.Host, Location: config.Location,
 		Load1: stats.Load1, Load5: stats.Load5, Load15: stats.Load15,
@@ -175,9 +178,36 @@ func watchdogEnvironment(config ServerConfig, stats AgentStats, online4, online6
 		MemoryTotal: float64(stats.MemoryTotal), MemoryUsed: float64(stats.MemoryUsed),
 		SwapTotal: float64(stats.SwapTotal), SwapUsed: float64(stats.SwapUsed),
 		HDDTotal: float64(stats.HDDTotal), HDDUsed: float64(stats.HDDUsed),
+		HDDMaxPct: maxPct, HDDMaxMount: maxMount,
 		IORead: float64(stats.IORead), IOWrite: float64(stats.IOWrite), CPU: stats.CPU,
 		Online4: boolNumber(online4), Online6: boolNumber(online6),
 	}
+}
+
+// hddMaxUsage returns the fullest partition percentage (0-100) and its mount
+// point. Agents that do not report per-partition data fall back to the
+// aggregated hdd_used/hdd_total ratio.
+func hddMaxUsage(stats AgentStats) (float64, string) {
+	if len(stats.HDDParts) > 0 {
+		pct := -1.0
+		mount := ""
+		for _, part := range stats.HDDParts {
+			if part.Total <= 0 {
+				continue
+			}
+			if value := float64(part.Used) / float64(part.Total) * 100; value > pct {
+				pct, mount = value, part.Mount
+			}
+		}
+		if pct < 0 {
+			pct = 0
+		}
+		return round2(pct), mount
+	}
+	if stats.HDDTotal > 0 {
+		return round2(float64(stats.HDDUsed) / float64(stats.HDDTotal) * 100), ""
+	}
+	return 0, ""
 }
 
 func expressionTruthy(result any) bool {

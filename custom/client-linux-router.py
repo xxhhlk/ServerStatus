@@ -143,35 +143,48 @@ def get_os_name():
         return 'unknown'
     return _os_name
 
-def get_hdd():
+HDD_PART_LIMIT = 16  # 上报分区明细条数上限，保证报文体积可控
+
+def get_hdd_parts():
+    """Per-mount usage as [(mountpoint, total_mb, used_mb)], fullest first."""
     valid_fs = {
         "ext4", "ext3", "ext2", "reiserfs", "jfs", "btrfs", "fuseblk",
         "zfs", "simfs", "ntfs", "fat32", "exfat", "xfs"
     }
     disks = {}
-    size = 0
-    used = 0
+    parts = []
     try:
         with open("/proc/mounts", "r") as f:
             for line in f:
-                parts = line.split()
-                if len(parts) < 3:
+                fields = line.split()
+                if len(fields) < 3:
                     continue
-                device = parts[0]
-                mountpoint = parts[1]
-                fstype = parts[2].lower()
+                device = fields[0]
+                mountpoint = fields[1]
+                fstype = fields[2].lower()
                 if fstype not in valid_fs or device in disks:
                     continue
                 disks[device] = mountpoint
-        for mountpoint in disks.values():
-            st = os.statvfs(mountpoint)
-            total_bytes = st.f_blocks * st.f_frsize
-            used_bytes = (st.f_blocks - st.f_bavail) * st.f_frsize
-            size += total_bytes
-            used += used_bytes
     except Exception:
-        pass
-    return int(size / 1024 / 1024), int(used / 1024 / 1024)
+        return parts
+    for mountpoint in disks.values():
+        try:
+            st = os.statvfs(mountpoint)
+        except OSError:
+            continue
+        total_mb = int(st.f_blocks * st.f_frsize / 1024 / 1024)
+        used_mb = int((st.f_blocks - st.f_bavail) * st.f_frsize / 1024 / 1024)
+        if total_mb <= 0:
+            continue
+        parts.append((mountpoint, total_mb, used_mb))
+    parts.sort(key=lambda part: part[2] / part[1], reverse=True)
+    return parts[:HDD_PART_LIMIT]
+
+def hdd_totals(parts):
+    return sum(part[1] for part in parts), sum(part[2] for part in parts)
+
+def get_hdd():
+    return hdd_totals(get_hdd_parts())
 
 def get_time():
     with open("/proc/stat", "r") as f:
@@ -973,7 +986,8 @@ if __name__ == '__main__':
                 Uptime = get_uptime()
                 Load_1, Load_5, Load_15 = os.getloadavg()
                 MemoryTotal, MemoryUsed, SwapTotal, SwapFree = get_memory()
-                HDDTotal, HDDUsed = get_hdd()
+                HDDParts = get_hdd_parts()
+                HDDTotal, HDDUsed = hdd_totals(HDDParts)
                 array = {}
                 # 在线探测已由独立线程 _net_probe_thread 负责，主循环只读快照（DNS 卡死不阻塞上报）
                 array['online' + str(check_ip)] = _online_status.get(check_ip, False)
@@ -988,6 +1002,7 @@ if __name__ == '__main__':
                 array['swap_used'] = SwapTotal - SwapFree
                 array['hdd_total'] = HDDTotal
                 array['hdd_used'] = HDDUsed
+                array['hdd_parts'] = [{'m': part[0], 't': part[1], 'u': part[2]} for part in HDDParts]
                 array['cpu'] = CPU
                 array['cpu_cores'] = CPUCores
                 array['cpu_model'] = CPUModel

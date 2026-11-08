@@ -305,6 +305,9 @@ func (a *App) snapshotStats() map[string]any {
 			base["memory_total"], base["memory_used"] = s.MemoryTotal, s.MemoryUsed
 			base["swap_total"], base["swap_used"] = s.SwapTotal, s.SwapUsed
 			base["hdd_total"], base["hdd_used"] = s.HDDTotal, s.HDDUsed
+			if len(s.HDDParts) > 0 {
+				base["hdd_parts"] = s.HDDParts
+			}
 			base["last_network_in"] = trafficBaseline(s.NetworkIn, node.LastNetworkIn)
 			base["last_network_out"] = trafficBaseline(s.NetworkOut, node.LastNetworkOut)
 			base["io_read"], base["io_write"] = s.IORead, s.IOWrite

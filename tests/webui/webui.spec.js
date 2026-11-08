@@ -14,11 +14,13 @@ const baseServerSpecs = [
   { name: 'india-online', location: 'CA-Toronto', os: 'debian', online4: true },
   { name: 'juliet-online', location: 'KR-Seoul', os: 'alpine', online4: true },
   { name: 'kilo-online', location: 'SG-Singapore', os: 'ubuntu', online4: true, online6: true },
-  { name: 'zulu-online', location: 'JP-Osaka', os: 'debian', online4: true }
+  { name: 'zulu-online', location: 'JP-Osaka', os: 'debian', online4: true },
+  // 聚合占用仅 27%，但 /data 已写满：用于锁定「按最满分区告警」
+  { name: 'lima-diskfull', location: 'SG-Singapore', os: 'debian', online4: true, diskFull: true }
 ];
 
 // 填充节点：在线、非 Windows、指标正常，因此不影响
-// 「离线=1 / 异常=2 / Windows=2 / KR-Seoul=1」这些筛选断言的语义。
+// 「离线=1 / 异常=3 / Windows=2 / KR-Seoul=1」这些筛选断言的语义。
 const fillerServerSpecs = Array.from({ length: 12 }, (_unused, index) => ({
   name: `filler-${String(index + 1).padStart(2, '0')}`,
   location: 'SG-Singapore',
@@ -32,7 +34,7 @@ const TOTAL_SERVERS = serverSpecs.length;
 function serverFixture(spec, index) {
   const received = 2_000_000_000 + index * 100_000_000;
   const sent = 1_000_000_000 + index * 50_000_000;
-  return {
+  const fixture = {
     name: spec.name,
     type: index % 2 ? 'kvm' : 'docker',
     host: `host-${index + 1}`,
@@ -73,6 +75,15 @@ function serverFixture(spec, index) {
     io_write: 50_000,
     custom: 'example=35'
   };
+  if (spec.diskFull) {
+    fixture.hdd_total = 1100 * 1024;
+    fixture.hdd_used = 300 * 1024;
+    fixture.hdd_parts = [
+      { m: '/', t: 1000 * 1024, u: 200 * 1024 },
+      { m: '/data', t: 100 * 1024, u: 100 * 1024 }
+    ];
+  }
+  return fixture;
 }
 
 const statsFixture = {
@@ -125,10 +136,26 @@ test('filters, focused OS selector and sorting stay stable across refreshes', as
 
 test('status filters distinguish offline and online alerts', async ({ page }) => {
   await page.getByRole('button', { name: '异常', exact: true }).click();
-  await expect(page.locator('#serversBody .row-server')).toHaveCount(2);
+  await expect(page.locator('#serversBody .row-server')).toHaveCount(3);
   await expect(page.locator('#serversBody')).toContainText('foxtrot-alert');
   await expect(page.locator('#serversBody')).toContainText('golf-blocked');
+  await expect(page.locator('#serversBody')).toContainText('lima-diskfull');
   await expect(page.locator('#serversBody')).not.toContainText('echo-offline');
+});
+
+test('disk alert follows the fullest partition instead of the aggregate', async ({ page }) => {
+  const row = page.locator('#serversBody .row-server', { hasText: 'lima-diskfull' });
+  await expect(row).toHaveClass(/alert-critical/);
+  const gauge = row.locator('.gauge-half[data-type="hdd"]');
+  await expect(gauge).toHaveAttribute('data-bad', '');
+  await expect(gauge).toHaveAttribute('title', /\/data/);
+
+  await row.click();
+  await expect(page.locator('#detailModal')).toBeVisible();
+  await expect(page.locator('.hdd-part')).toHaveCount(2);
+  await expect(page.locator('.hdd-part').first()).toContainText('/data');
+  await expect(page.locator('.hdd-part').first()).toContainText('100%');
+  await expect(page.locator('.resource-flag')).toContainText('/data');
 });
 
 test('online node detail shows resources and labeled charts', async ({ page }) => {

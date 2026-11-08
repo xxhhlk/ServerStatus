@@ -162,6 +162,68 @@ func TestReloadNoticeIsIndependentFromPersistence(t *testing.T) {
 	}
 }
 
+func TestSnapshotCarriesPerPartitionDiskUsage(t *testing.T) {
+	app := newTestApp(t, minimalTestConfig())
+	app.nodeMu.Lock()
+	node := app.nodes["s01"]
+	node.Connected = true
+	node.HasUpdate = true
+	node.Stats = AgentStats{
+		HDDTotal: 1100,
+		HDDUsed:  300,
+		HDDParts: []HDDPart{
+			{Mount: "/", Total: 1000, Used: 200},
+			{Mount: "/data", Total: 100, Used: 100},
+		},
+	}
+	app.nodeMu.Unlock()
+
+	live := app.SnapshotStats()["servers"].([]any)[0].(map[string]any)
+	data, err := json.Marshal(live)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		HDDTotal int64 `json:"hdd_total"`
+		HDDUsed  int64 `json:"hdd_used"`
+		HDDParts []struct {
+			Mount string `json:"m"`
+			Total int64  `json:"t"`
+			Used  int64  `json:"u"`
+		} `json:"hdd_parts"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.HDDParts) != 2 {
+		t.Fatalf("per-partition usage missing from snapshot payload: %s", data)
+	}
+	if payload.HDDParts[1].Mount != "/data" || payload.HDDParts[1].Total != 100 || payload.HDDParts[1].Used != 100 {
+		t.Fatalf("unexpected partition payload: %#v", payload.HDDParts[1])
+	}
+	if payload.HDDTotal != 1100 || payload.HDDUsed != 300 {
+		t.Fatalf("aggregate disk usage changed: %#v", payload)
+	}
+}
+
+func TestAgentsWithoutPartitionsKeepAggregateOnly(t *testing.T) {
+	app := newTestApp(t, minimalTestConfig())
+	app.nodeMu.Lock()
+	node := app.nodes["s01"]
+	node.Connected = true
+	node.HasUpdate = true
+	node.Stats = AgentStats{HDDTotal: 1000, HDDUsed: 200}
+	app.nodeMu.Unlock()
+
+	live := app.SnapshotStats()["servers"].([]any)[0].(map[string]any)
+	if _, exists := live["hdd_parts"]; exists {
+		t.Fatalf("legacy agents must not emit hdd_parts: %#v", live["hdd_parts"])
+	}
+	if live["hdd_total"] != int64(1000) || live["hdd_used"] != int64(200) {
+		t.Fatalf("aggregate disk usage changed: %#v", live)
+	}
+}
+
 func TestResetTrafficPersistsImmediately(t *testing.T) {
 	app := newTestApp(t, minimalTestConfig())
 	app.nodeMu.Lock()

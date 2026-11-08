@@ -215,34 +215,47 @@ def get_swap():
 _hdd_mounts = None
 _hdd_mounts_clock = 0.0
 HDD_REFRESH_INTERVAL = 60  # 分区表重枚举间隔（秒），保证热插盘也能被发现
+HDD_PART_LIMIT = 16  # 上报分区明细条数上限，保证报文体积可控
 
-def get_hdd():
+def get_hdd_parts():
+    """Per-mount usage as [(mountpoint, total_mb, used_mb)], fullest first."""
     global _hdd_mounts, _hdd_mounts_clock
     if "darwin" in sys.platform:
-        return int(psutil.disk_usage("/").total/1024.0/1024.0), int((psutil.disk_usage("/").total-psutil.disk_usage("/").free)/1024.0/1024.0)
-    elif sys.platform.startswith("win"):
+        usage = psutil.disk_usage("/")
+        return [("/", int(usage.total/1024.0/1024.0), int(usage.used/1024.0/1024.0))]
+    if sys.platform.startswith("win"):
         # Windows：只统计系统盘（SystemDrive，通常 C:），避免多盘/外置盘混入
         sysdrive = os.environ.get("SystemDrive", "C:") + os.sep
         usage = psutil.disk_usage(sysdrive)
-        return int(usage.total/1024.0/1024.0), int(usage.used/1024.0/1024.0)
-    else:
-        now = time.monotonic()
-        if _hdd_mounts is None or now - _hdd_mounts_clock > HDD_REFRESH_INTERVAL:
-            valid_fs = ["ext4", "ext3", "ext2", "reiserfs", "jfs", "btrfs", "fuseblk", "zfs", "simfs", "ntfs", "fat32",
-                        "exfat", "xfs"]
-            disks = dict()
-            for disk in psutil.disk_partitions():
-                if not disk.device in disks and disk.fstype.lower() in valid_fs:
-                    disks[disk.device] = disk.mountpoint
-            _hdd_mounts = list(disks.values())
-            _hdd_mounts_clock = now
-        size = 0
-        used = 0
-        for disk in _hdd_mounts:
+        return [(sysdrive, int(usage.total/1024.0/1024.0), int(usage.used/1024.0/1024.0))]
+    now = time.monotonic()
+    if _hdd_mounts is None or now - _hdd_mounts_clock > HDD_REFRESH_INTERVAL:
+        valid_fs = ["ext4", "ext3", "ext2", "reiserfs", "jfs", "btrfs", "fuseblk", "zfs", "simfs", "ntfs", "fat32",
+                    "exfat", "xfs"]
+        disks = dict()
+        for disk in psutil.disk_partitions():
+            if not disk.device in disks and disk.fstype.lower() in valid_fs:
+                disks[disk.device] = disk.mountpoint
+        _hdd_mounts = list(disks.values())
+        _hdd_mounts_clock = now
+    parts = []
+    for disk in _hdd_mounts:
+        try:
             usage = psutil.disk_usage(disk)
-            size += usage.total
-            used += usage.used
-        return int(size/1024.0/1024.0), int(used/1024.0/1024.0)
+        except OSError:
+            continue
+        total_mb = int(usage.total/1024.0/1024.0)
+        if total_mb <= 0:
+            continue
+        parts.append((disk, total_mb, int(usage.used/1024.0/1024.0)))
+    parts.sort(key=lambda part: part[2] / part[1], reverse=True)
+    return parts[:HDD_PART_LIMIT]
+
+def hdd_totals(parts):
+    return sum(part[1] for part in parts), sum(part[2] for part in parts)
+
+def get_hdd():
+    return hdd_totals(get_hdd_parts())
 
 def get_cpu():
     return psutil.cpu_percent(interval=INTERVAL)
@@ -1296,7 +1309,8 @@ if __name__ == '__main__':
                     Load_1, Load_5, Load_15 = 0.0, 0.0, 0.0
                 MemoryTotal, MemoryUsed = get_memory()
                 SwapTotal, SwapUsed = get_swap()
-                HDDTotal, HDDUsed = get_hdd()
+                HDDParts = get_hdd_parts()
+                HDDTotal, HDDUsed = hdd_totals(HDDParts)
                 array = {}
                 # 在线探测已由独立线程 _net_probe_thread 负责，主循环只读快照（DNS 卡死不阻塞上报）
                 array['online' + str(check_ip)] = _online_status.get(check_ip, False)
@@ -1311,6 +1325,7 @@ if __name__ == '__main__':
                 array['swap_used'] = SwapUsed
                 array['hdd_total'] = HDDTotal
                 array['hdd_used'] = HDDUsed
+                array['hdd_parts'] = [{'m': part[0], 't': part[1], 'u': part[2]} for part in HDDParts]
                 array['cpu'] = CPU
                 array['cpu_cores'] = CPUCores
                 array['cpu_model'] = CPUModel

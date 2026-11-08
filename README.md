@@ -260,9 +260,15 @@ cpu>90 && load_1>5 && username!='s01'
 username='节点一号'&name='上海节点'&location='中国 🇨🇳'&type='云主机'
 ```
 
-字段名必须使用系统定义的英文名称。可用字段包括：`username`、`name`、`type`、`host`、`location`、`load_1`、`load_5`、`load_15`、`cpu`、`memory_total`、`memory_used`、`swap_total`、`swap_used`、`hdd_total`、`hdd_used`、`network_rx`、`network_tx`、`network_in`、`network_out`、`last_network_in`、`last_network_out`、`ping_10010`、`ping_189`、`ping_10086`、`time_10010`、`time_189`、`time_10086`、`tcp_count`、`udp_count`、`process_count`、`thread_count`、`io_read`、`io_write`、`online4`、`online6`。
+字段名必须使用系统定义的英文名称。可用字段包括：`username`、`name`、`type`、`host`、`location`、`load_1`、`load_5`、`load_15`、`cpu`、`memory_total`、`memory_used`、`swap_total`、`swap_used`、`hdd_total`、`hdd_used`、`hdd_max_pct`、`hdd_max_mount`、`network_rx`、`network_tx`、`network_in`、`network_out`、`last_network_in`、`last_network_out`、`ping_10010`、`ping_189`、`ping_10086`、`time_10010`、`time_189`、`time_10086`、`tcp_count`、`udp_count`、`process_count`、`thread_count`、`io_read`、`io_write`、`online4`、`online6`。
 
 客户端断开 25 秒后仍未重连，服务端才计算离线规则，避免短暂网络波动触发告警。每个节点、每条规则分别记录冷却时间。
+
+`hdd_max_pct` 是最满分区的占用百分比（0-100），`hdd_max_mount` 是该分区的挂载点；客户端未上报分区明细时，`hdd_max_pct` 回退为 `hdd_used/hdd_total` 的聚合值，`hdd_max_mount` 为空。多分区机器请用 `hdd_max_pct` 而不是聚合比值判定，避免小分区写满被总量稀释：
+
+```text
+hdd_max_pct>90
+```
 
 ### SSL 证书
 

@@ -324,6 +324,11 @@ th[data-sort].sorted-desc:after{border-top-color:var(--accent);opacity:1}
 .resource-meter[data-level=warn] .resource-track i{background:var(--warn)}
 .resource-meter[data-level=bad] .resource-track i{background:var(--danger)}
 .resource-mini{border-top:1px solid var(--border);padding-top:.45rem}
+.resource-flag{font-style:normal;font-size:10px;font-weight:700;line-height:1.5;margin-left:.35rem;padding:0 .3rem;border-radius:4px;color:var(--danger);background:color-mix(in srgb,var(--danger) 16%,transparent)}
+.hdd-parts{display:flex;flex-direction:column;gap:.34rem;margin-left:.1rem;padding-left:.6rem;border-left:2px solid color-mix(in srgb,var(--border) 90%,transparent)}
+.hdd-part .resource-meter-head span{max-width:46%;overflow:hidden;text-overflow:ellipsis}
+.hdd-part .resource-meter-head strong{font-size:10px}
+.hdd-part .resource-track{height:5px}
 .chart-section{gap:.55rem}
 .chart-head{display:flex;align-items:center;justify-content:space-between;gap:.75rem;flex-wrap:wrap}
 .chart-head h4{margin:0}

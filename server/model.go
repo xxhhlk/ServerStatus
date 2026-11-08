@@ -65,40 +65,49 @@ type RuntimeConfig struct {
 	Watchdogs []CompiledWatchdog
 }
 
+// HDDPart is one mounted filesystem as reported by the client. Sizes are in
+// the same unit as hdd_total/hdd_used (MB).
+type HDDPart struct {
+	Mount string `json:"m"`
+	Total int64  `json:"t"`
+	Used  int64  `json:"u"`
+}
+
 type AgentStats struct {
-	Uptime       int64   `json:"uptime"`
-	Load1        float64 `json:"load_1"`
-	Load5        float64 `json:"load_5"`
-	Load15       float64 `json:"load_15"`
-	Ping10010    float64 `json:"ping_10010"`
-	Ping189      float64 `json:"ping_189"`
-	Ping10086    float64 `json:"ping_10086"`
-	Time10010    int64   `json:"time_10010"`
-	Time189      int64   `json:"time_189"`
-	Time10086    int64   `json:"time_10086"`
-	TCPCount     int64   `json:"tcp"`
-	UDPCount     int64   `json:"udp"`
-	ProcessCount int64   `json:"process"`
-	ThreadCount  int64   `json:"thread"`
-	NetworkRX    int64   `json:"network_rx"`
-	NetworkTX    int64   `json:"network_tx"`
-	NetworkIn    int64   `json:"network_in"`
-	NetworkOut   int64   `json:"network_out"`
-	MemoryTotal  int64   `json:"memory_total"`
-	MemoryUsed   int64   `json:"memory_used"`
-	SwapTotal    int64   `json:"swap_total"`
-	SwapUsed     int64   `json:"swap_used"`
-	HDDTotal     int64   `json:"hdd_total"`
-	HDDUsed      int64   `json:"hdd_used"`
-	IORead       int64   `json:"io_read"`
-	IOWrite      int64   `json:"io_write"`
-	CPU          float64 `json:"cpu"`
-	CPUCores     int64   `json:"cpu_cores"`
-	CPUModel     string  `json:"cpu_model"`
-	Custom       string  `json:"custom"`
-	OS           string  `json:"os"`
-	Online4      *bool   `json:"online4"`
-	Online6      *bool   `json:"online6"`
+	Uptime       int64     `json:"uptime"`
+	Load1        float64   `json:"load_1"`
+	Load5        float64   `json:"load_5"`
+	Load15       float64   `json:"load_15"`
+	Ping10010    float64   `json:"ping_10010"`
+	Ping189      float64   `json:"ping_189"`
+	Ping10086    float64   `json:"ping_10086"`
+	Time10010    int64     `json:"time_10010"`
+	Time189      int64     `json:"time_189"`
+	Time10086    int64     `json:"time_10086"`
+	TCPCount     int64     `json:"tcp"`
+	UDPCount     int64     `json:"udp"`
+	ProcessCount int64     `json:"process"`
+	ThreadCount  int64     `json:"thread"`
+	NetworkRX    int64     `json:"network_rx"`
+	NetworkTX    int64     `json:"network_tx"`
+	NetworkIn    int64     `json:"network_in"`
+	NetworkOut   int64     `json:"network_out"`
+	MemoryTotal  int64     `json:"memory_total"`
+	MemoryUsed   int64     `json:"memory_used"`
+	SwapTotal    int64     `json:"swap_total"`
+	SwapUsed     int64     `json:"swap_used"`
+	HDDTotal     int64     `json:"hdd_total"`
+	HDDUsed      int64     `json:"hdd_used"`
+	HDDParts     []HDDPart `json:"hdd_parts,omitempty"`
+	IORead       int64     `json:"io_read"`
+	IOWrite      int64     `json:"io_write"`
+	CPU          float64   `json:"cpu"`
+	CPUCores     int64     `json:"cpu_cores"`
+	CPUModel     string    `json:"cpu_model"`
+	Custom       string    `json:"custom"`
+	OS           string    `json:"os"`
+	Online4      *bool     `json:"online4"`
+	Online6      *bool     `json:"online6"`
 }
 
 type APIError struct {

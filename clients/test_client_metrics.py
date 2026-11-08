@@ -495,6 +495,96 @@ veth123: 8000 8 0 0 0 0 0 0 8000 8 0 0 0 0 0 0
         for name, a, b in zip(("tcp", "udp", "process", "thread"), native, legacy):
             self.assertLessEqual(abs(a - b), max(5, b // 20), name)
 
+    # --- 硬盘分区 ---------------------------------------------------------
+
+    def test_linux_hdd_parts_surfaces_fullest_partition(self):
+        """聚合占用会把小分区写满稀释掉；parts 必须按占用率排序，前端据此告警。"""
+        ns = load_client("client-linux.py")
+        mounts = (
+            "/dev/sda1 / ext4 rw,relatime 0 0\n"
+            "/dev/sdb1 /data ext4 rw,relatime 0 0\n"
+            "/dev/sdc1 /mnt/usb ntfs rw 0 0\n"
+            "tmpfs /run tmpfs rw 0 0\n"
+        )
+        sizes = {"/": (1000, 200), "/data": (100, 100), "/mnt/usb": (10, 1)}
+
+        def fake_statvfs(mountpoint):
+            total_gb, used_gb = sizes[mountpoint]
+            frsize = 4096
+            blocks = total_gb * 1024 * 1024 * 1024 // frsize
+            used_blocks = used_gb * 1024 * 1024 * 1024 // frsize
+            return types.SimpleNamespace(f_blocks=blocks, f_frsize=frsize, f_bavail=blocks - used_blocks)
+
+        fake_os = types.SimpleNamespace(statvfs=fake_statvfs)
+        with mock.patch.dict(ns["get_hdd_parts"].__globals__, {"open": open_from({"/proc/mounts": mounts}), "os": fake_os}):
+            parts = ns["get_hdd_parts"]()
+            total, used = ns["hdd_totals"](parts)
+            self.assertEqual(ns["get_hdd"](), (total, used))
+
+        self.assertEqual([part[0] for part in parts], ["/data", "/", "/mnt/usb"])
+        self.assertEqual(parts[0][1], 100 * 1024)
+        self.assertEqual(parts[0][2], 100 * 1024)
+        self.assertLess(used / total * 100, 30)
+
+    def test_linux_hdd_parts_skips_unreadable_mount(self):
+        """单个挂载点失效不能让整机硬盘数据归零。"""
+        ns = load_client("client-linux.py")
+        mounts = "/dev/sda1 / ext4 rw 0 0\n/dev/sdb1 /data ext4 rw 0 0\n"
+
+        def fake_statvfs(mountpoint):
+            if mountpoint == "/":
+                raise OSError(5, "I/O error")
+            return types.SimpleNamespace(f_blocks=100 * 1024 * 1024, f_frsize=4096, f_bavail=20 * 1024 * 1024)
+
+        fake_os = types.SimpleNamespace(statvfs=fake_statvfs)
+        with mock.patch.dict(ns["get_hdd_parts"].__globals__, {"open": open_from({"/proc/mounts": mounts}), "os": fake_os}):
+            parts = ns["get_hdd_parts"]()
+
+        self.assertEqual([part[0] for part in parts], ["/data"])
+
+    def test_psutil_hdd_parts_surfaces_fullest_partition(self):
+        """psutil 分支同样要按挂载点上报，且过滤掉非白名单文件系统。"""
+        ns = load_client("client-psutil.py")
+        partitions = [
+            types.SimpleNamespace(device="/dev/sda1", mountpoint="/", fstype="ext4"),
+            types.SimpleNamespace(device="/dev/sdb1", mountpoint="/data", fstype="ext4"),
+            types.SimpleNamespace(device="/dev/sr0", mountpoint="/media/cdrom", fstype="iso9660"),
+        ]
+        usage = {"/": (1000, 200), "/data": (100, 100)}
+
+        def fake_disk_usage(mountpoint):
+            total_gb, used_gb = usage[mountpoint]
+            return types.SimpleNamespace(total=total_gb * 1024 ** 3, used=used_gb * 1024 ** 3)
+
+        fake_psutil = types.SimpleNamespace(disk_partitions=lambda: partitions, disk_usage=fake_disk_usage)
+        fake_sys = types.SimpleNamespace(platform="linux")
+        with mock.patch.dict(ns["get_hdd_parts"].__globals__, {"psutil": fake_psutil, "sys": fake_sys}):
+            parts = ns["get_hdd_parts"]()
+            total, used = ns["hdd_totals"](parts)
+
+        self.assertEqual([part[0] for part in parts], ["/data", "/"])
+        self.assertLess(used / total * 100, 30)
+
+    def test_hdd_part_limit_keeps_fullest_mounts(self):
+        """条数上限按占用率截断，不能把最满的分区丢掉。"""
+        ns = load_client("client-linux.py")
+        lines = "".join("/dev/sd%c1 /mnt/disk%02d ext4 rw 0 0\n" % (chr(97 + i), i) for i in range(20))
+        sizes = {"/mnt/disk%02d" % i: (100, i) for i in range(20)}
+
+        def fake_statvfs(mountpoint):
+            total_gb, used_gb = sizes[mountpoint]
+            frsize = 4096
+            blocks = total_gb * 1024 * 1024 * 1024 // frsize
+            used_blocks = used_gb * 1024 * 1024 * 1024 // frsize
+            return types.SimpleNamespace(f_blocks=blocks, f_frsize=frsize, f_bavail=blocks - used_blocks)
+
+        fake_os = types.SimpleNamespace(statvfs=fake_statvfs)
+        with mock.patch.dict(ns["get_hdd_parts"].__globals__, {"open": open_from({"/proc/mounts": lines}), "os": fake_os}):
+            parts = ns["get_hdd_parts"]()
+
+        self.assertEqual(len(parts), ns["HDD_PART_LIMIT"])
+        self.assertEqual(parts[0][0], "/mnt/disk19")
+
     # --- Linux _disk_io（单轮扫描 + comm 缓存）----------------------------
 
     def test_linux_disk_io_diffs_consecutive_rounds(self):

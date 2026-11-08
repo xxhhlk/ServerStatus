@@ -181,10 +181,24 @@ function osResourceThresholds(s){
   return { cpu:{warn:75,bad:90}, mem:{warn:80,bad:90}, swap:{warn:80,bad:90}, hdd:{warn:85,bad:90} };
 }
 
+function hddParts(s){
+  if(Array.isArray(s?._hddParts)) return s._hddParts;
+  const raw = Array.isArray(s?.hdd_parts) ? s.hdd_parts : [];
+  const parts = raw.map(item => {
+    const total = num(item?.t), used = num(item?.u);
+    return total > 0 ? { mount: String(item?.m || ''), total, used, pct: clamp(used / total * 100, 0, 100) } : null;
+  }).filter(Boolean).sort((a, b) => b.pct - a.pct);
+  if(s) s._hddParts = parts;
+  return parts;
+}
+
 function metrics(s){
   const online = !!(s.online4 || s.online6);
   const memPct = s.memory_total ? s.memory_used / s.memory_total * 100 : 0;
-  const hddPct = s.hdd_total ? s.hdd_used / s.hdd_total * 100 : 0;
+  const parts = hddParts(s);
+  // 多分区取最满的一个判定，避免小分区写满被总量稀释
+  const hddPct = parts.length ? parts[0].pct : (s.hdd_total ? s.hdd_used / s.hdd_total * 100 : 0);
+  const hddMount = parts.length ? parts[0].mount : '';
   const thresholds = osResourceThresholds(s);
   const monthIn = Math.max(0, num(s.network_in) - num(s.last_network_in));
   const monthOut = Math.max(0, num(s.network_out) - num(s.last_network_out));
@@ -199,7 +213,7 @@ function metrics(s){
   const critical = online && (resourceCritical || blocked || lossCritical);
   const warning = online && (resourceWarning || lossWarning);
   const rowLevel = !online || critical ? 'critical' : (resourceWarning || lossWarning ? 'warning' : '');
-  return { online, memPct, hddPct, monthIn, monthOut, traffic, loss, blocked, alert: critical || warning, rowLevel };
+  return { online, memPct, hddPct, hddMount, hddParts: parts, monthIn, monthOut, traffic, loss, blocked, alert: critical || warning, rowLevel };
 }
 
 async function fetchData(){
@@ -430,32 +444,50 @@ function loadCellHTML(s){
   if(!cores) return esc(load);
   return `<span class="load-with-cores" title="负载 ${esc(load)} / CPU ${esc(cores)}"><span class="load-value">${esc(load)}</span><span class="load-core-bubble">${esc(cores)}</span></span>`;
 }
-function gaugeHTML(type, value, s){
+function gaugeHTML(type, value, s, note){
   const pct = clamp(num(value), 0, 100);
   const thresholds = osResourceThresholds(s)[type] || { warn: 75, bad: 90 };
   const warnAttr = pct >= thresholds.bad ? 'data-bad' : (pct >= thresholds.warn ? 'data-warn' : '');
   const label = type === 'cpu' ? 'CPU' : type === 'mem' ? '内存' : '硬盘';
-  return `<div class="gauge-half" data-type="${type}" ${warnAttr} style="--p:${(pct / 100).toFixed(3)}" title="${label} ${pct.toFixed(0)}%">
+  const title = `${label} ${pct.toFixed(0)}%${note ? ' · ' + note : ''}`;
+  return `<div class="gauge-half" data-type="${type}" ${warnAttr} style="--p:${(pct / 100).toFixed(3)}" title="${esc(title)}">
     <svg viewBox="0 0 100 50" preserveAspectRatio="xMidYMid meet" aria-hidden="true"><path class="track" d="M10 50 A40 40 0 0 1 90 50" /><path class="arc" d="M10 50 A40 40 0 0 1 90 50" /></svg>
     <span>${pct.toFixed(0)}%</span>
   </div>`;
 }
-function resourceMeter(label, value, pct, kind, s){
+function resourceMeter(label, value, pct, kind, s, badge){
   const safePct = clamp(num(pct), 0, 100);
   const thresholds = osResourceThresholds(s)[kind] || { warn: 75, bad: 90 };
   const level = safePct >= thresholds.bad ? 'bad' : (safePct >= thresholds.warn ? 'warn' : 'ok');
+  const flag = badge ? `<em class="resource-flag" title="最满分区 ${esc(badge)}">${esc(badge)}</em>` : '';
   return `<div class="resource-meter" data-kind="${esc(kind)}" data-level="${level}" style="--p:${safePct.toFixed(1)}%">
-    <div class="resource-meter-head"><span>${esc(label)}</span><strong>${esc(value)}</strong></div>
+    <div class="resource-meter-head"><span>${esc(label)}${flag}</span><strong>${esc(value)}</strong></div>
     <div class="resource-track"><i></i></div>
   </div>`;
 }
+function hddPartsHTML(s, parts){
+  if(!parts || !parts.length) return '';
+  const thresholds = osResourceThresholds(s).hdd;
+  return `<div class="hdd-parts">${parts.map(part => {
+    const level = part.pct >= thresholds.bad ? 'bad' : (part.pct >= thresholds.warn ? 'warn' : 'ok');
+    return `<div class="resource-meter hdd-part" data-kind="hdd" data-level="${level}" style="--p:${part.pct.toFixed(1)}%">
+      <div class="resource-meter-head"><span class="hdd-part-mount" title="${esc(part.mount || '-')}">${esc(part.mount || '-')}</span><strong>${humanMinMBFromMB(part.used)} / ${humanMinMBFromMB(part.total)} · ${part.pct.toFixed(0)}%</strong></div>
+      <div class="resource-track"><i></i></div>
+    </div>`;
+  }).join('')}</div>`;
+}
 function detailResourceHTML(s, m){
   const swapPct = s.swap_total ? num(s.swap_used) / num(s.swap_total) * 100 : 0;
+  const parts = m.hddParts || [];
+  const totalPct = s.hdd_total ? num(s.hdd_used) / num(s.hdd_total) * 100 : 0;
+  const worst = parts.length ? parts[0] : null;
+  const badge = worst && worst.pct >= osResourceThresholds(s).hdd.warn ? `${worst.mount || '分区'} ${worst.pct.toFixed(0)}%` : '';
   return `
     ${resourceMeter('CPU', `${num(s.cpu).toFixed(0)}%`, num(s.cpu), 'cpu', s)}
     ${resourceMeter('内存', `${humanMinMBFromKB(s.memory_used)} / ${humanMinMBFromKB(s.memory_total)}`, m.memPct, 'mem', s)}
     ${resourceMeter('虚存', `${humanMinMBFromKB(s.swap_used)} / ${humanMinMBFromKB(s.swap_total)}`, swapPct, 'swap', s)}
-    ${resourceMeter('硬盘', `${humanMinMBFromMB(s.hdd_used)} / ${humanMinMBFromMB(s.hdd_total)}`, m.hddPct, 'hdd', s)}
+    ${resourceMeter(parts.length ? '硬盘合计' : '硬盘', `${humanMinMBFromMB(s.hdd_used)} / ${humanMinMBFromMB(s.hdd_total)}`, totalPct, 'hdd', s, badge)}
+    ${hddPartsHTML(s, parts)}
     <div class="resource-mini"><span>IO</span><strong>读 ${humanMinMBFromB(s.io_read)} / 写 ${humanMinMBFromB(s.io_write)}</strong></div>`;
 }
 function packetLossLine(s){
@@ -478,6 +510,7 @@ function serverRowSignature(s, m){
     s.name, s.type, s.location, s.uptime, s.load_1, cpuCores(s),
     s.network_rx, s.network_tx, s.network_in, s.network_out, s.last_network_in, s.last_network_out,
     s.cpu, s.memory_used, s.memory_total, s.hdd_used, s.hdd_total,
+    m.hddPct, m.hddMount, (s.hdd_parts || []).length,
     s.ping_10010, s.ping_189, s.ping_10086
   ].map(v => String(v ?? '')).join('\u001f');
   return `${stableHash(text).toString(36)}:${text.length}`;
@@ -499,7 +532,7 @@ function serverRowHTML(s, m, signature){
     <td>${netTotal}</td>
     <td>${m.online ? gaugeHTML('cpu', s.cpu, s) : '-'}</td>
     <td>${m.online ? gaugeHTML('mem', m.memPct, s) : '-'}</td>
-    <td>${m.online ? gaugeHTML('hdd', m.hddPct, s) : '-'}</td>
+    <td>${m.online ? gaugeHTML('hdd', m.hddPct, s, m.hddMount ? '最满 ' + m.hddMount : '') : '-'}</td>
     <td>${buckets(s)}</td>
   </tr>`;
 }
